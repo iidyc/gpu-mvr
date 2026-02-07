@@ -1,6 +1,9 @@
+#pragma once
+
 #include <vector>
 #include <queue>
 #include <unordered_map>
+#include <omp.h>
 
 #include "rabitqlib/quantization/rabitq_impl.hpp"
 #include "rabitqlib/utils/rotator.hpp"
@@ -12,7 +15,7 @@
 
 using namespace rabitqlib;
 
-struct gpu_mvr_index {
+struct cpu_mvr_index {
     size_t n;           // number of vectors
     size_t d;           // dimension
     size_t n_clusters;  // number of clusters
@@ -33,12 +36,12 @@ struct gpu_mvr_index {
 
     float (*ip_func_)(const float*, const uint8_t*, size_t);
 
-    gpu_mvr_index(const std::string& filename) {
+    cpu_mvr_index(const std::string& filename) {
         load(filename);
         ip_func_ = select_excode_ipfunc(ex_bits);
     }
 
-    gpu_mvr_index(
+    cpu_mvr_index(
         size_t n,
         size_t d,
         size_t n_clusters,
@@ -158,7 +161,6 @@ struct gpu_mvr_index {
         std::vector<float> doc_dists(q_doclen * num_docs);
         double gather_matrix_time = 0.0;
         for (int j = 0; j < q_doclen; ++j) {
-            std::vector<float> token_dists;
             std::vector<size_t> ids;
             ivf->search(queries[j].rotated_query, nprobe, ids);
             for (size_t idx = 0; idx < ids.size(); ++idx) {
@@ -314,7 +316,7 @@ struct gpu_mvr_index {
         ivf->load(filename);
     }
 
-    ~gpu_mvr_index() {
+    ~cpu_mvr_index() {
         delete rotator_;
         delete ivf;
     }

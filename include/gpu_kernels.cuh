@@ -1,0 +1,359 @@
+#pragma once
+
+#include <cuda_runtime.h>
+#include <cstddef>
+#include <cstdint>
+#include <cfloat>
+
+__device__ __forceinline__ uint64_t device_reverse_bits_u64(uint64_t n) {
+    return __brevll(n);
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    return val;
+}
+
+// ============================================================================
+// Core binary inner product — bank-conflict-free shared memory access
+// ============================================================================
+
+/**
+ * Compute binary IP between a query in shared memory and a binary code.
+ * Uses stride-1 access in two passes of 32 elements per 64-bit block
+ * to avoid shared memory bank conflicts.
+ *
+ * Previous approach: lane k reads smem[base + k*2], smem[base + k*2 + 1]
+ *   → lane 0 and lane 16 both hit bank 0 (2-way conflict)
+ *
+ * Fixed approach: two passes with stride-1
+ *   Pass 1: lane k reads smem[base + k]       → bank k, no conflicts
+ *   Pass 2: lane k reads smem[base + 32 + k]  → bank k, no conflicts
+ */
+__device__ __forceinline__ float compute_binary_ip_partial(
+    const float* __restrict__ smem_query,  // [padded_dim] in shared memory
+    const uint64_t* __restrict__ code_ptr, // binary code in global memory
+    int lane,
+    size_t num_u64
+) {
+    float partial_sum = 0.0f;
+    for (size_t blk = 0; blk < num_u64; blk++) {
+        uint64_t bits = device_reverse_bits_u64(code_ptr[blk]);
+        size_t base = blk * 64;
+
+        // Pass 1: lanes 0-31 handle positions base..base+31 (stride-1, no bank conflicts)
+        if ((bits >> lane) & 1ULL)
+            partial_sum += smem_query[base + lane];
+
+        // Pass 2: lanes 0-31 handle positions base+32..base+63 (stride-1, no bank conflicts)
+        if ((bits >> (32 + lane)) & 1ULL)
+            partial_sum += smem_query[base + 32 + lane];
+    }
+    return partial_sum;
+}
+
+// ============================================================================
+// Stage 1: Binary IP kernel with shared memory query caching
+// ============================================================================
+
+/**
+ * Grid: (blocks_x, q_doclen). Each y-slice handles one query.
+ * Loads query into shared memory once; warps process different emb_ids.
+ * Emb IDs are stored contiguously per query via d_pair_offsets.
+ *
+ * d_pair_offsets: [q_doclen + 1] cumulative pair count per query
+ * d_emb_ids:     [num_pairs] sorted by query_idx
+ * d_out_dists:   [num_pairs] output, same order as d_emb_ids
+ */
+__global__ void stage1_binary_ip_kernel(
+    const float* __restrict__ d_queries,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const size_t* __restrict__ d_emb_ids,
+    const int*   __restrict__ d_pair_offsets,
+    float* __restrict__ d_out_dists,
+    size_t padded_dim,
+    size_t q_doclen
+) {
+    extern __shared__ float smem_query[];
+
+    int query_idx = blockIdx.y;
+    if (query_idx >= q_doclen) return;
+
+    // Coalesced load: adjacent threads load adjacent floats
+    const float* q_ptr = d_queries + query_idx * padded_dim;
+    for (int i = threadIdx.x; i < padded_dim; i += blockDim.x) {
+        smem_query[i] = q_ptr[i];
+    }
+    __syncthreads();
+
+    float cb1_sumq = d_cb1_sumq[query_idx];
+    size_t pair_start = d_pair_offsets[query_idx];
+    size_t pair_end = d_pair_offsets[query_idx + 1];
+    size_t num_embs = pair_end - pair_start;
+
+    const int lane = threadIdx.x & 31;
+    const int warp_local_id = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const size_t code_bytes = padded_dim / 8;
+    const size_t num_u64 = padded_dim / 64;
+
+    for (size_t w = warp_local_id + (size_t)blockIdx.x * warps_per_block;
+         w < num_embs;
+         w += (size_t)warps_per_block * gridDim.x)
+    {
+        size_t emb_id = d_emb_ids[pair_start + w];
+        const uint64_t* code_ptr = (const uint64_t*)(d_one_bit_code + emb_id * code_bytes);
+
+        float partial = compute_binary_ip_partial(smem_query, code_ptr, lane, num_u64);
+        float ip = warp_reduce_sum(partial);
+
+        if (lane == 0) {
+            d_out_dists[pair_start + w] = (ip - cb1_sumq) * d_one_bit_factor[emb_id];
+        }
+    }
+}
+
+// ============================================================================
+// Stage 2: Binary IP kernel — writes in [query][token] layout for coalescing
+// ============================================================================
+
+/**
+ * Grid: (blocks_x, q_doclen). Each y-slice handles one query.
+ * Loads query into shared memory; warps process different tokens.
+ *
+ * Output layout: [query][token] — d_out_dists[query_idx * total_tokens + tok_idx]
+ * This ensures that adjacent warps (processing consecutive tok_idx within the same
+ * query block) write to adjacent addresses, maximizing L2 write coalescing.
+ *
+ * (Previous [token][query] layout had adjacent warps writing addresses q_doclen apart.)
+ */
+__global__ void stage2_binary_ip_kernel(
+    const float* __restrict__ d_queries,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const size_t* __restrict__ d_token_ids,
+    float* __restrict__ d_out_dists,       // layout: [query][token]
+    size_t padded_dim,
+    size_t q_doclen,
+    size_t total_tokens
+) {
+    extern __shared__ float smem_query[];
+
+    int query_idx = blockIdx.y;
+    if (query_idx >= q_doclen) return;
+
+    const float* q_ptr = d_queries + query_idx * padded_dim;
+    for (int i = threadIdx.x; i < padded_dim; i += blockDim.x) {
+        smem_query[i] = q_ptr[i];
+    }
+    __syncthreads();
+
+    float cb1_sumq = d_cb1_sumq[query_idx];
+    const int lane = threadIdx.x & 31;
+    const int warp_local_id = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const size_t code_bytes = padded_dim / 8;
+    const size_t num_u64 = padded_dim / 64;
+
+    for (size_t tok_idx = warp_local_id + (size_t)blockIdx.x * warps_per_block;
+         tok_idx < total_tokens;
+         tok_idx += (size_t)warps_per_block * gridDim.x)
+    {
+        size_t token_id = d_token_ids[tok_idx];
+        const uint64_t* code_ptr = (const uint64_t*)(d_one_bit_code + token_id * code_bytes);
+
+        float partial = compute_binary_ip_partial(smem_query, code_ptr, lane, num_u64);
+        float ip = warp_reduce_sum(partial);
+
+        if (lane == 0) {
+            // [query][token] layout: adjacent tok_idx → adjacent addresses
+            d_out_dists[query_idx * total_tokens + tok_idx] =
+                (ip - cb1_sumq) * d_one_bit_factor[token_id];
+        }
+    }
+}
+
+// ============================================================================
+// Stage 2: Document scoring — tiled reads to improve memory access
+// ============================================================================
+
+/**
+ * One block per candidate document.
+ * Input layout: [query][token] — d_token_dists[q * total_tokens + tok]
+ *
+ * Strategy: each thread handles one query. For the max-pool over tokens,
+ * we tile tokens through shared memory so that all threads in the block
+ * cooperatively load a tile of token distances (coalesced), then each thread
+ * reads its query's value from shared memory (bank-conflict-free stride-1).
+ *
+ * Shared memory layout: [TILE_SIZE][q_doclen_padded] where q_doclen_padded
+ * is q_doclen rounded up to avoid bank conflicts. But since q_doclen is small
+ * (typically 32), we use a simpler approach: tile in the token dimension.
+ */
+__global__ void doc_score_kernel(
+    const float*  __restrict__ d_token_dists,  // [q_doclen][total_tokens]
+    const size_t* __restrict__ d_candidate_offsets,
+    float*        d_doc_scores,
+    size_t q_doclen,
+    size_t total_tokens,
+    size_t num_candidates
+) {
+    constexpr int TILE_T = 8;
+    extern __shared__ float smem[];
+    // smem layout: tile[q_doclen * TILE_T] + max_vals[q_doclen] + reduce_buf[blockDim.x]
+    float* tile = smem;
+    float* max_vals = smem + q_doclen * TILE_T;
+    float* reduce_buf = max_vals + q_doclen;
+
+    size_t cand_idx = blockIdx.x;
+    if (cand_idx >= num_candidates) return;
+
+    size_t tok_start = d_candidate_offsets[cand_idx];
+    size_t tok_end = d_candidate_offsets[cand_idx + 1];
+    size_t num_tokens = tok_end - tok_start;
+
+    // Initialize per-query max values cooperatively (all threads participate)
+    for (int j = threadIdx.x; j < (int)q_doclen; j += blockDim.x) {
+        max_vals[j] = -FLT_MAX;
+    }
+    __syncthreads();
+
+    // Tile loop is the outer loop — ALL threads reach every __syncthreads()
+    for (size_t t_base = 0; t_base < num_tokens; t_base += TILE_T) {
+        int tile_size = ((size_t)TILE_T < num_tokens - t_base) ? TILE_T : (int)(num_tokens - t_base);
+
+        // Cooperative tile load: ALL threads participate
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < (int)q_doclen * tile_size; idx += blockDim.x) {
+            int q = idx / tile_size;
+            int t_local = idx % tile_size;
+            tile[q * TILE_T + t_local] = d_token_dists[q * total_tokens + tok_start + t_base + t_local];
+        }
+        __syncthreads();
+
+        // Each thread updates max for its assigned queries
+        for (size_t j = threadIdx.x; j < q_doclen; j += blockDim.x) {
+            float local_max = max_vals[j];
+            for (int t_local = 0; t_local < tile_size; t_local++) {
+                local_max = fmaxf(local_max, tile[j * TILE_T + t_local]);
+            }
+            max_vals[j] = local_max;
+        }
+    }
+    __syncthreads();
+
+    // Sum max values across queries
+    float my_sum = 0.0f;
+    for (size_t j = threadIdx.x; j < q_doclen; j += blockDim.x) {
+        my_sum += max_vals[j];
+    }
+
+    // Block-level reduction
+    reduce_buf[threadIdx.x] = my_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduce_buf[threadIdx.x] += reduce_buf[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        d_doc_scores[cand_idx] = reduce_buf[0];
+    }
+}
+
+// ============================================================================
+// Stage 2: Extract selected token dists — coalesced with layout transpose
+// ============================================================================
+
+/**
+ * Extracts top-k candidates' token dists from [query][token] GPU layout
+ * and writes to [token][query] layout (for CPU stage 3 consumption).
+ *
+ * One block per selected candidate. Threads iterate linearly over
+ * output elements (contiguous in memory) for coalesced writes.
+ * Reads are strided (one per query plane) but benefit from L2 cache.
+ */
+__global__ void extract_one_bit_dists_kernel(
+    const float*  __restrict__ d_token_dists,     // [q_doclen][total_tokens] GPU layout
+    const size_t* __restrict__ d_candidate_offsets,
+    const size_t* __restrict__ d_selected_indices,
+    float*        d_out_one_bit_dists,             // [token][query] output layout
+    const size_t* __restrict__ d_out_offsets,
+    size_t q_doclen,
+    size_t total_tokens,
+    size_t k
+) {
+    size_t sel_idx = blockIdx.x;
+    if (sel_idx >= k) return;
+
+    size_t cand_idx = d_selected_indices[sel_idx];
+    size_t tok_start = d_candidate_offsets[cand_idx];
+    size_t tok_end = d_candidate_offsets[cand_idx + 1];
+    size_t num_tokens = tok_end - tok_start;
+    size_t out_base = d_out_offsets[sel_idx];
+    size_t total_elems = num_tokens * q_doclen;
+
+    // Iterate over output elements linearly for coalesced writes
+    // Output layout: [token][query] → out[(out_base + t) * q_doclen + q]
+    // Adjacent threads write adjacent addresses when iterating linearly
+    for (size_t i = threadIdx.x; i < total_elems; i += blockDim.x) {
+        size_t t_local = i / q_doclen;
+        size_t q_idx = i - t_local * q_doclen;  // avoid expensive modulo
+
+        // Read from [query][token] layout
+        float val = d_token_dists[q_idx * total_tokens + tok_start + t_local];
+        // Write to [token][query] layout
+        d_out_one_bit_dists[(out_base + t_local) * q_doclen + q_idx] = val;
+    }
+}
+
+// ============================================================================
+// Gather token IDs (expand doc IDs to token IDs on GPU)
+// ============================================================================
+
+/**
+ * One block per candidate doc. Threads write contiguous token IDs → coalesced.
+ */
+__global__ void gather_token_ids_kernel(
+    const size_t* __restrict__ d_candidate_doc_ids,
+    const int*    __restrict__ d_doc_ptrs,
+    const size_t* __restrict__ d_candidate_offsets,
+    size_t*       d_out_token_ids,
+    size_t num_candidates
+) {
+    size_t cand_idx = blockIdx.x;
+    if (cand_idx >= num_candidates) return;
+
+    size_t doc_id = d_candidate_doc_ids[cand_idx];
+    int doc_start = d_doc_ptrs[doc_id];
+    int doc_end = d_doc_ptrs[doc_id + 1];
+    size_t out_offset = d_candidate_offsets[cand_idx];
+
+    for (int t = threadIdx.x; t < (doc_end - doc_start); t += blockDim.x) {
+        d_out_token_ids[out_offset + t] = doc_start + t;
+    }
+}
+
+// ============================================================================
+// Utility: map_emb_to_doc (stage 1 helper, coalesced read/write)
+// ============================================================================
+
+__global__ void map_emb_to_doc_kernel(
+    const float*  __restrict__ d_emb_dists,
+    const size_t* __restrict__ d_emb_ids,
+    const int*    __restrict__ d_pair_query_indices,
+    const int*    __restrict__ d_doc_ids,
+    int*          d_out_doc_ids,
+    size_t num_pairs
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_pairs) return;
+    d_out_doc_ids[idx] = d_doc_ids[d_emb_ids[idx]];
+}
