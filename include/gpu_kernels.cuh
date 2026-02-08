@@ -283,7 +283,7 @@ __global__ void doc_score_kernel(
 __global__ void extract_one_bit_dists_kernel(
     const float*  __restrict__ d_token_dists,     // [q_doclen][total_tokens] GPU layout
     const size_t* __restrict__ d_candidate_offsets,
-    const size_t* __restrict__ d_selected_indices,
+    const int*    __restrict__ d_selected_indices,
     float*        d_out_one_bit_dists,             // [token][query] output layout
     const size_t* __restrict__ d_out_offsets,
     size_t q_doclen,
@@ -322,7 +322,7 @@ __global__ void extract_one_bit_dists_kernel(
  * One block per candidate doc. Threads write contiguous token IDs → coalesced.
  */
 __global__ void gather_token_ids_kernel(
-    const size_t* __restrict__ d_candidate_doc_ids,
+    const int*    __restrict__ d_candidate_doc_ids,
     const int*    __restrict__ d_doc_ptrs,
     const size_t* __restrict__ d_candidate_offsets,
     size_t*       d_out_token_ids,
@@ -331,7 +331,7 @@ __global__ void gather_token_ids_kernel(
     size_t cand_idx = blockIdx.x;
     if (cand_idx >= num_candidates) return;
 
-    size_t doc_id = d_candidate_doc_ids[cand_idx];
+    int doc_id = d_candidate_doc_ids[cand_idx];
     int doc_start = d_doc_ptrs[doc_id];
     int doc_end = d_doc_ptrs[doc_id + 1];
     size_t out_offset = d_candidate_offsets[cand_idx];
@@ -357,3 +357,191 @@ __global__ void map_emb_to_doc_kernel(
     if (idx >= num_pairs) return;
     d_out_doc_ids[idx] = d_doc_ids[d_emb_ids[idx]];
 }
+// ============================================================================
+// NEW: Stage 1 GPU aggregation kernels
+// ============================================================================
+
+/**
+ * Build (doc_id, query_idx, dist) tuples from embedding-level results.
+ * Parallel expansion from emb_ids → doc_ids using d_pair_query_indices.
+ */
+__global__ void build_doc_query_keys_kernel(
+    const size_t* __restrict__ d_emb_ids,
+    const int*    __restrict__ d_doc_ids,
+    const int*    __restrict__ d_pair_offsets,
+    float*        __restrict__ d_emb_dists,
+    int*          d_out_doc_ids,
+    int*          d_out_query_indices,
+    size_t total_pairs,
+    size_t q_doclen
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_pairs) return;
+
+    // Binary search to find which query this pair belongs to
+    int q_idx = 0;
+    for (int q = 0; q < q_doclen; ++q) {
+        if (idx < d_pair_offsets[q + 1]) {
+            q_idx = q;
+            break;
+        }
+    }
+
+    size_t emb_id = d_emb_ids[idx];
+    int doc_id = d_doc_ids[emb_id];
+    
+    d_out_doc_ids[idx] = doc_id;
+    d_out_query_indices[idx] = q_idx;
+}
+
+/**
+ * Compute final document scores from max-pooled distances.
+ * One thread per (doc, query) → sum across queries using atomics.
+ * Input: d_max_dists[num_unique_pairs] — already max-pooled per (doc, query)
+ * Keys: d_doc_ids[num_unique_pairs], d_query_indices[num_unique_pairs]
+ * Output: d_doc_scores[num_unique_docs] — sum of max distances across queries
+ */
+__global__ void aggregate_doc_scores_kernel(
+    const int*   __restrict__ d_unique_doc_ids,
+    const float* __restrict__ d_max_dists,
+    int*         d_doc_id_to_idx,  // [max_doc_id + 1] mapping
+    float*       d_doc_scores,
+    size_t num_unique_pairs,
+    size_t num_unique_docs
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_unique_pairs) return;
+
+    int doc_id = d_unique_doc_ids[idx];
+    float max_dist = d_max_dists[idx];
+    
+    // Atomic add to accumulate scores for each document
+    int doc_idx = d_doc_id_to_idx[doc_id];
+    atomicAdd(&d_doc_scores[doc_idx], max_dist);
+}
+
+/**
+ * Build composite key for sorting: (doc_id << 16) | query_idx
+ * Assumes doc_id and query_idx both fit in 16 bits.
+ */
+__global__ void build_composite_keys_kernel(
+    const int* __restrict__ d_doc_ids,
+    const int* __restrict__ d_query_indices,
+    int*       d_composite_keys,
+    size_t total_pairs
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_pairs) return;
+    
+    int doc_id = d_doc_ids[idx];
+    int q_idx = d_query_indices[idx];
+    // Composite key: high bits = doc_id, low bits = query_idx
+    d_composite_keys[idx] = (doc_id << 16) | q_idx;
+}
+
+// ============================================================================
+// NEW: Stage 2 GPU offset computation
+// ============================================================================
+
+/**
+ * Gather document pointers for top-k docs to compute token counts.
+ * Each thread handles one document.
+ */
+__global__ void gather_doc_lengths_kernel(
+    const int* __restrict__ d_topk_doc_ids,
+    const int* __restrict__ d_doc_ptrs,
+    int*       d_doc_lengths,
+    size_t k
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= k) return;
+    
+    int doc_id = d_topk_doc_ids[idx];
+    int doc_len = d_doc_ptrs[doc_id + 1] - d_doc_ptrs[doc_id];
+    d_doc_lengths[idx] = doc_len;
+}
+
+/**
+ * Extract document IDs from composite keys: doc_id = composite >> 16
+ */
+__global__ void extract_doc_ids_from_composite_kernel(
+    const int* __restrict__ d_composite_keys,
+    int*       d_doc_ids,
+    size_t n
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    d_doc_ids[idx] = d_composite_keys[idx] >> 16;
+}
+
+// Atomic max for floats using compare-and-swap
+__device__ __forceinline__ float atomicMaxFloat(float* address, float val) {
+    int* address_as_int = (int*)address;
+    int old = *address_as_int, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_int, assumed,
+                       __float_as_int(fmaxf(val, __int_as_float(assumed))));
+    } while (assumed != old);
+    return __int_as_float(old);
+}
+
+/**
+ * Atomic max-pooling and aggregation for Stage 1.
+ * Each (emb_id, query_idx) → (doc_id, query_idx) → atomic max into doc_query_matrix
+ * Then sum across queries for each doc.
+ */
+__global__ void aggregate_stage1_atomic_kernel(
+    const size_t* __restrict__ d_emb_ids,
+    const float*  __restrict__ d_emb_dists,
+    const int*    __restrict__ d_pair_offsets,
+    const int*    __restrict__ d_doc_ids,
+    float*        d_doc_query_max,  // [num_docs * q_doclen] matrix
+    size_t        q_doclen,
+    size_t        num_docs,
+    size_t        total_pairs
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_pairs) return;
+
+    // Find which query this embedding belongs to
+    int q_idx = 0;
+    for (int q = 0; q < q_doclen; ++q) {
+        if (idx < d_pair_offsets[q + 1]) {
+            q_idx = q;
+            break;
+        }
+    }
+
+    size_t emb_id = d_emb_ids[idx];
+    int doc_id = d_doc_ids[emb_id];
+    float dist = d_emb_dists[idx];
+
+    // Bounds check
+    if (doc_id >= num_docs) return;
+
+    // Atomic max into doc_query_max[doc_id * q_doclen + q_idx]
+    size_t matrix_idx = (size_t)doc_id * q_doclen + q_idx;
+    atomicMaxFloat(&d_doc_query_max[matrix_idx], dist);
+}
+
+/**
+ * Sum max distances across queries for each document.
+ */
+__global__ void sum_doc_scores_kernel(
+    const float* __restrict__ d_doc_query_max,  // [num_docs * q_doclen]
+    float*       d_doc_scores,                   // [num_docs]
+    size_t       num_docs,
+    size_t       q_doclen
+) {
+    size_t doc_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (doc_id >= num_docs) return;
+
+    float score = 0.0f;
+    for (size_t q = 0; q < q_doclen; ++q) {
+        score += d_doc_query_max[doc_id * q_doclen + q];
+    }
+    d_doc_scores[doc_id] = score;
+}
+
+
