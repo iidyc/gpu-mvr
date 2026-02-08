@@ -18,6 +18,8 @@ add_compile_options(
     -fexceptions
 )
 
+# add_compile_definitions(GPU_MVR_PROFILE)
+
 include_directories("include")
 
 add_executable(build expr/build.cpp)
