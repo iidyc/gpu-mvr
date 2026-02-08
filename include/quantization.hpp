@@ -18,7 +18,7 @@ constexpr std::array<float, 9> kTightStart = {
     0.81,
 };
 
-// pack 0/1 data to usigned integer
+// pack 0/1 data to unsigned integer (LSB-first: dimension i+j maps to bit j)
 inline void pack_binary(
     const int* __restrict__ binary_code, uint64_t* __restrict__ compact_code, size_t length
 ) {
@@ -27,7 +27,7 @@ inline void pack_binary(
     for (size_t i = 0; i < length; i += kTypeBits) {
         uint64_t cur = 0;
         for (size_t j = 0; j < kTypeBits; ++j) {
-            cur |= (static_cast<uint64_t>(binary_code[i + j]) << (kTypeBits - 1 - j));
+            cur |= (static_cast<uint64_t>(binary_code[i + j]) << j);
         }
         *compact_code = cur;
         ++compact_code;

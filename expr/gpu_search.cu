@@ -9,11 +9,11 @@ int main() {
     std::vector<float> Q = load_query(q_doclen, num_q, d);
     std::vector<int> doclens = load_doclens();
 
-    gpu_mvr_index index("2097152_4.index", doclens);
+    gpu_mvr_index index("2097152_4_new.index", doclens);
 
     Timer timer;
     timer.tick();
-    int nq = 100;
+    int nq = num_q;
     std::vector<std::vector<size_t>> results(nq);
     for (size_t i = 0; i < nq; ++i) {
         results[i] = index.search(&Q[i * q_doclen * d], q_doclen, k, nprobe);

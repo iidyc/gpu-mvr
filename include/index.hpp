@@ -65,7 +65,7 @@ struct cpu_mvr_index {
 
     void build_index(const float* data) {
         quantize(data);
-        ivf->build_from_existing();
+        // ivf->build_from_existing();
     }
 
     /***
@@ -289,7 +289,7 @@ struct cpu_mvr_index {
         of.write((char*)one_bit_factor_.data(), one_bit_factor_.size() * sizeof(float));
         of.write((char*)ex_factor_.data(), ex_factor_.size() * sizeof(float));
         of.close();
-        ivf->save(filename);
+        // ivf->save(filename);
     }
 
     void load(const std::string& filename) {

@@ -166,7 +166,7 @@ inline T normalize_vec(
     return static_cast<T>(dim) * value;
 }
 
-// pack 0/1 data to usigned integer
+// pack 0/1 data to unsigned integer (LSB-first: dimension i+j maps to bit j)
 template <typename T>
 inline void pack_binary(
     const int* __restrict__ binary_code, T* __restrict__ compact_code, size_t length
@@ -176,7 +176,7 @@ inline void pack_binary(
     for (size_t i = 0; i < length; i += kTypeBits) {
         T cur = 0;
         for (size_t j = 0; j < kTypeBits; ++j) {
-            cur |= (static_cast<T>(binary_code[i + j]) << (kTypeBits - 1 - j));
+            cur |= (static_cast<T>(binary_code[i + j]) << j);
         }
         *compact_code = cur;
         ++compact_code;
@@ -596,24 +596,7 @@ inline ex_ipfunc select_excode_ipfunc(size_t ex_bits) {
     exit(1);
 }
 
-static inline uint32_t reverse_bits(uint32_t n) {
-    n = ((n >> 1) & 0x55555555) | ((n << 1) & 0xaaaaaaaa);
-    n = ((n >> 2) & 0x33333333) | ((n << 2) & 0xcccccccc);
-    n = ((n >> 4) & 0x0f0f0f0f) | ((n << 4) & 0xf0f0f0f0);
-    n = ((n >> 8) & 0x00ff00ff) | ((n << 8) & 0xff00ff00);
-    n = ((n >> 16) & 0x0000ffff) | ((n << 16) & 0xffff0000);
-    return n;
-}
 
-static inline uint64_t reverse_bits_u64(uint64_t n) {
-    n = ((n >> 1) & 0x5555555555555555) | ((n << 1) & 0xaaaaaaaaaaaaaaaa);
-    n = ((n >> 2) & 0x3333333333333333) | ((n << 2) & 0xcccccccccccccccc);
-    n = ((n >> 4) & 0x0f0f0f0f0f0f0f0f) | ((n << 4) & 0xf0f0f0f0f0f0f0f0);
-    n = ((n >> 8) & 0x00ff00ff00ff00ff) | ((n << 8) & 0xff00ff00ff00ff00);
-    n = ((n >> 16) & 0x0000ffff0000ffff) | ((n << 16) & 0xffff0000ffff0000);
-    n = ((n >> 32) & 0x00000000ffffffff) | ((n << 32) & 0xffffffff00000000);
-    return n;
-}
 
 inline void transpose_bin(
     const uint16_t* q, uint64_t* tq, size_t padded_dim, size_t b_query
@@ -624,9 +607,9 @@ inline void transpose_bin(
         v = _mm512_slli_epi32(v, (16 - b_query));
         for (size_t j = 0; j < b_query; ++j) {
             uint32_t v1 = _mm512_movepi16_mask(v);  // get most significant bit
-            v1 = reverse_bits(v1);
+            // LSB-first: first 32 dims → low 32 bits, next 32 dims → high 32 bits
             tq[((b_query - j - 1) * (padded_dim / 64)) + (i / 64)] |=
-                (static_cast<uint64_t>(v1) << ((i / 32 % 2 == 0) ? 32 : 0));
+                (static_cast<uint64_t>(v1) << ((i / 32 % 2 == 0) ? 0 : 32));
             v = _mm512_add_epi32(v, v);
         }
         q += 32;
@@ -648,10 +631,8 @@ static inline void new_transpose_bin(
         for (size_t j = 0; j < b_query; ++j) {
             uint32_t v0 = _mm512_movepi16_mask(vec_00_to_31);  // get most significant bit
             uint32_t v1 = _mm512_movepi16_mask(vec_32_to_63);  // get most significant bit
-            // [TODO: remove all reverse_bits]
-            v0 = reverse_bits(v0);
-            v1 = reverse_bits(v1);
-            uint64_t v = (static_cast<uint64_t>(v0) << 32) + v1;
+            // LSB-first: v0 (dims 0-31) in low 32 bits, v1 (dims 32-63) in high 32 bits
+            uint64_t v = static_cast<uint64_t>(v0) | (static_cast<uint64_t>(v1) << 32);
 
             tq[b_query - j - 1] = v;
 
@@ -670,8 +651,8 @@ inline float mask_ip_x0_q_old(const float* query, const uint64_t* data, size_t p
 
     __m512 sum = _mm512_setzero_ps();
     for (size_t i = 0; i < num_blk; ++i) {
-        uint64_t bits = reverse_bits_u64(*it_data);
-        __mmask16 mask0 = static_cast<__mmask16>(bits >> 00);  // for q[0..15]
+        uint64_t bits = *it_data;
+        __mmask16 mask0 = static_cast<__mmask16>(bits);        // for q[0..15]
         __mmask16 mask1 = static_cast<__mmask16>(bits >> 16);  // for q[16..31]
         __mmask16 mask2 = static_cast<__mmask16>(bits >> 32);  // for q[32..47]
         __mmask16 mask3 = static_cast<__mmask16>(bits >> 48);  // for q[48..63]
@@ -709,7 +690,7 @@ inline float mask_ip_x0_q(const float* query, const uint64_t* data, size_t padde
 
     __m512 sum = _mm512_setzero_ps();
     for (size_t i = 0; i < num_blk; ++i) {
-        uint64_t bits = reverse_bits_u64(*it_data);
+        uint64_t bits = *it_data;
 
         __mmask16 mask0 = static_cast<__mmask16>(bits);
         __mmask16 mask1 = static_cast<__mmask16>(bits >> 16);

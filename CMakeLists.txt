@@ -19,6 +19,7 @@ add_compile_options(
 )
 
 # add_compile_definitions(GPU_MVR_PROFILE)
+# add_compile_definitions(GPU_MVR_OVERLAP_STAGE23)
 
 include_directories("include")
 

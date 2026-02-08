@@ -5,10 +5,6 @@
 #include <cstdint>
 #include <cfloat>
 
-__device__ __forceinline__ uint64_t device_reverse_bits_u64(uint64_t n) {
-    return __brevll(n);
-}
-
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
         val += __shfl_xor_sync(0xffffffff, val, offset);
@@ -39,7 +35,7 @@ __device__ __forceinline__ float compute_binary_ip_partial(
 ) {
     float partial_sum = 0.0f;
     for (size_t blk = 0; blk < num_u64; blk++) {
-        uint64_t bits = device_reverse_bits_u64(code_ptr[blk]);
+        uint64_t bits = code_ptr[blk];
         size_t base = blk * 64;
 
         // Pass 1: lanes 0-31 handle positions base..base+31 (stride-1, no bank conflicts)
