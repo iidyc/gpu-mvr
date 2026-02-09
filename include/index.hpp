@@ -3,6 +3,8 @@
 #include <vector>
 #include <queue>
 #include <unordered_map>
+#include <chrono>
+#include <iostream>
 #include <omp.h>
 
 #include "rabitqlib/quantization/rabitq_impl.hpp"
@@ -128,8 +130,8 @@ struct cpu_mvr_index {
     }
 
     std::vector<size_t> search(const float* queries, size_t q_doclen, size_t k, size_t nprobe) {
-        int k_rank_cluster = 20000;
-        int k_rank_all_tokens = 1000;
+        int k_rank_cluster = 1800;
+        int k_rank_all_tokens = 1800;
 
         std::vector<float> rotated_queries(q_doclen * padded_dim_);
         for (size_t i = 0; i < q_doclen; ++i) {
@@ -139,11 +141,14 @@ struct cpu_mvr_index {
         for (size_t i = 0; i < q_doclen; ++i) {
             query_objs[i] = query_object(&rotated_queries[i * padded_dim_], padded_dim_, ex_bits);
         }
+        auto t0 = std::chrono::high_resolution_clock::now();
         std::vector<size_t> rank_cluster_doc_ids;
         rank_cluster_dists(query_objs.data(), q_doclen, nprobe, k_rank_cluster, rank_cluster_doc_ids);
+        auto t1 = std::chrono::high_resolution_clock::now();
         std::vector<size_t> rank_all_tokens_ids;
         std::vector<float> one_bit_dists;
         rank_all_tokens_1bit(query_objs.data(), q_doclen, rank_cluster_doc_ids, k_rank_all_tokens, rank_all_tokens_ids, one_bit_dists);
+        auto t2 = std::chrono::high_resolution_clock::now();
         std::vector<size_t> result;
         rank_all_tokens_exbits(
             query_objs.data(),
@@ -153,6 +158,12 @@ struct cpu_mvr_index {
             k,
             result
         );
+        auto t3 = std::chrono::high_resolution_clock::now();
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        std::cout << "[search] stage1_cluster: " << ms(t0, t1) << " ms, "
+                  << "stage2_1bit: " << ms(t1, t2) << " ms, "
+                  << "stage3_exbits: " << ms(t2, t3) << " ms, "
+                  << "total: " << ms(t0, t3) << " ms\n";
         return result;
     }
 
@@ -160,6 +171,7 @@ struct cpu_mvr_index {
         std::vector<bool> doc_found(num_docs, false);
         std::vector<float> doc_dists(q_doclen * num_docs);
         double gather_matrix_time = 0.0;
+#pragma omp parallel for
         for (int j = 0; j < q_doclen; ++j) {
             std::vector<size_t> ids;
             ivf->search(queries[j].rotated_query, nprobe, ids);
@@ -205,6 +217,7 @@ struct cpu_mvr_index {
             candidate_doc_ptrs[i + 1] = total_tokens;
         }
         std::vector<float> token_dists(total_tokens * q_doclen);
+#pragma omp parallel for
         for (size_t idx = 0; idx < input_ids.size(); ++idx) {
             size_t doc_id = input_ids[idx];
             float doc_score = 0.0F;
@@ -218,6 +231,7 @@ struct cpu_mvr_index {
                 }
                 doc_score += max_token_score;
             }
+#pragma omp critical
             max_heap.emplace(doc_score, doc_id);
         }
         for (int i = 0; i < k && !max_heap.empty(); ++i) {
@@ -248,6 +262,7 @@ struct cpu_mvr_index {
             candidate_doc_ptrs[i + 1] = total_tokens;
         }
         std::priority_queue<std::pair<float, size_t>> max_heap;
+#pragma omp parallel for
         for (size_t idx = 0; idx < input_ids.size(); ++idx) {
             size_t doc_id = input_ids[idx];
             float doc_score = 0.0F;
@@ -269,6 +284,7 @@ struct cpu_mvr_index {
                 }
                 doc_score += max_token_score;
             }
+#pragma omp critical
             max_heap.emplace(doc_score, doc_id);
         }
         for (int i = 0; i < k && !max_heap.empty(); ++i) {

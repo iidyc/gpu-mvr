@@ -18,6 +18,10 @@ add_compile_options(
     -fexceptions
 )
 
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=68,177,186>
+)
+
 # add_compile_definitions(GPU_MVR_PROFILE)
 # add_compile_definitions(GPU_MVR_OVERLAP_STAGE23)
 

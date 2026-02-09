@@ -37,6 +37,7 @@
 #include "estimator.hpp"
 #include "query.hpp"
 #include "ivf_pg.hpp"
+#include "gpu_config.cuh"
 #include "gpu_kernels.cuh"
 
 using namespace rabitqlib;
@@ -85,7 +86,7 @@ struct gpu_mvr_index {
     size_t d;
     size_t n_clusters;
     size_t ex_bits;
-    size_t padded_dim_;
+    // padded_dim_ removed - using PADDED_DIM constant from gpu_config.cuh
     size_t num_docs;
 
     int max_doc_len;       // for workspace sizing
@@ -108,8 +109,9 @@ struct gpu_mvr_index {
     int*   d_doc_ptrs_;         // [num_docs + 1]
 
     // Search parameters
-    int k_rank_cluster = 15000;    
-    int k_rank_all_tokens = 1000;
+    int nprobe = 128;
+    int k_rank_cluster = 1800;    
+    int k_rank_all_tokens = 1800;
 
     // Pre-allocated GPU workspace (sized for worst-case per search)
     struct Workspace {
@@ -136,8 +138,8 @@ struct gpu_mvr_index {
         float*  d_out_one_bit_dists; // [max_stage2_k_tokens * max_q_doclen]
 
         // Stage 1 CAGRA batched search workspace
-        float*        d_cagra_dists;     // [max_q_doclen * max_nprobe]
-        faiss::idx_t* d_cagra_labels;    // [max_q_doclen * max_nprobe]
+        float*        d_cagra_dists;     // [max_q_doclen * nprobe]
+        faiss::idx_t* d_cagra_labels;    // [max_q_doclen * nprobe]
 
         // === NEW: GPU-only Stage 1 aggregation workspace ===
         int*    d_sorted_doc_ids;        // [max_stage1_pairs] for segmented reduction
@@ -162,11 +164,10 @@ struct gpu_mvr_index {
         size_t* h_pinned_emb_ids;
         int*    h_pinned_pair_offsets;
         float*  h_pinned_dists;
-        faiss::idx_t* h_pinned_cagra_labels; // [max_q_doclen * max_nprobe]
+        faiss::idx_t* h_pinned_cagra_labels; // [max_q_doclen * nprobe]
         float*  h_pinned_batch_scores;       // [max_stage2_candidates] batch D2H
 
         size_t max_q_doclen;
-        size_t max_nprobe;
         size_t max_stage1_pairs;
         size_t max_stage2_candidates;
         size_t max_stage2_tokens;
@@ -210,17 +211,28 @@ struct gpu_mvr_index {
     } ws_;
 
     // Construct from file
-    gpu_mvr_index(const std::string& filename, const std::vector<int>& doc_lens,
-                  size_t max_q_doclen = 32, size_t max_nprobe = 128) {
+    gpu_mvr_index(const std::string& filename, const std::vector<int>& doc_lens) {
         std::ifstream inf(filename, std::ios::binary);
         inf.read((char*)&n, sizeof(size_t));
         inf.read((char*)&d, sizeof(size_t));
         inf.read((char*)&n_clusters, sizeof(size_t));
         inf.read((char*)&ex_bits, sizeof(size_t));
-        inf.read((char*)&padded_dim_, sizeof(size_t));
 
-        std::vector<char> one_bit_code(n * padded_dim_ / 8);
-        ex_code_.resize(n * padded_dim_ * ex_bits / 8);
+        // Read padded_dim from file and validate it matches compiled constant
+        size_t file_padded_dim;
+        inf.read((char*)&file_padded_dim, sizeof(size_t));
+
+        if (file_padded_dim != PADDED_DIM) {
+            inf.close();
+            throw std::runtime_error(
+                "Index file padded_dim=" + std::to_string(file_padded_dim) +
+                " does not match compiled PADDED_DIM=" + std::to_string(PADDED_DIM) +
+                ". Please recompile with matching PADDED_DIM in gpu_config.cuh"
+            );
+        }
+
+        std::vector<char> one_bit_code(n * PADDED_DIM / 8);
+        ex_code_.resize(n * PADDED_DIM * ex_bits / 8);
         one_bit_factor_.resize(n);
         ex_factor_.resize(n);
 
@@ -230,7 +242,7 @@ struct gpu_mvr_index {
         inf.read((char*)ex_factor_.data(), n * sizeof(float));
         inf.close();
 
-        rotator_ = choose_rotator<float>(d, RotatorType::FhtKacRotator, padded_dim_);
+        rotator_ = choose_rotator<float>(d, RotatorType::FhtKacRotator, PADDED_DIM);
         std::ifstream rot_in("rotator.bin", std::ios::binary);
         rotator_->load(rot_in);
         rot_in.close();
@@ -244,7 +256,7 @@ struct gpu_mvr_index {
         set_doc_mapping(doc_lens);
 
         // Allocate persistent GPU data
-        size_t code_bytes = n * padded_dim_ / 8;
+        size_t code_bytes = n * PADDED_DIM / 8;
         CUDA_CHECK(cudaMalloc(&d_one_bit_code_, code_bytes));
         CUDA_CHECK(cudaMalloc(&d_one_bit_factor_, n * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_doc_ids_, n * sizeof(int)));
@@ -256,7 +268,7 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaMemcpy(d_doc_ptrs_, doc_ptrs_.data(), (num_docs + 1) * sizeof(int), cudaMemcpyHostToDevice));
 
         // Allocate workspace
-        allocate_workspace(max_q_doclen, max_nprobe);
+        allocate_workspace();
     }
 
     void set_doc_mapping(const std::vector<int>& doc_lens) {
@@ -274,12 +286,11 @@ struct gpu_mvr_index {
         }
     }
 
-    void allocate_workspace(size_t max_q_doclen, size_t max_nprobe) {
+    void allocate_workspace() {
         // Estimate worst-case sizes
-        // Stage 1: nprobe clusters * max_cluster_size * q_doclen pairs
-        ws_.max_q_doclen = max_q_doclen;
-        ws_.max_nprobe = max_nprobe;
-        ws_.max_stage1_pairs = max_nprobe * max_cluster_size * max_q_doclen;
+        // Stage 1: nprobe clusters * max_cluster_size * Q_DOCLEN pairs
+        ws_.max_q_doclen = Q_DOCLEN;
+        ws_.max_stage1_pairs = nprobe * max_cluster_size * Q_DOCLEN;
         ws_.max_stage2_candidates = k_rank_cluster;  // k_rank_cluster
         // Estimate avg ~100 tokens per doc
         ws_.max_stage2_tokens = ws_.max_stage2_candidates * max_doc_len;
@@ -288,12 +299,18 @@ struct gpu_mvr_index {
         ws_.estimated_num_docs = (size_t)num_docs;
 
         // Query workspace
-        CUDA_CHECK(cudaMalloc(&ws_.d_queries, max_q_doclen * padded_dim_ * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ws_.d_cb1_sumq, max_q_doclen * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_cb1_sumq, Q_DOCLEN * sizeof(float)));
 
         // Stage 1 workspace
         CUDA_CHECK(cudaMalloc(&ws_.d_emb_ids, ws_.max_stage1_pairs * sizeof(size_t)));
-        CUDA_CHECK(cudaMalloc(&ws_.d_pair_offsets, (max_q_doclen + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_pair_offsets, (Q_DOCLEN + 1) * sizeof(int)));
+
+        // OPTIMIZATION: Allocate emb_dists for [query][embedding] layout
+        // Worst case: Q_DOCLEN * (max_stage1_pairs / Q_DOCLEN) = max_stage1_pairs
+        // But to handle uneven distribution, allocate Q_DOCLEN * max_stage1_pairs/Q_DOCLEN with padding
+        // For safety, we allocate the full max_stage1_pairs which is always sufficient
+        // since sum(embs_per_query[i]) <= max_stage1_pairs
         CUDA_CHECK(cudaMalloc(&ws_.d_emb_dists, ws_.max_stage1_pairs * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ws_.d_pair_doc_ids, ws_.max_stage1_pairs * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ws_.d_pair_query_indices, ws_.max_stage1_pairs * sizeof(int)));
@@ -305,7 +322,7 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaMalloc(&ws_.d_unique_doc_ids, ws_.estimated_num_docs * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ws_.d_doc_offsets, (ws_.estimated_num_docs + 1) * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ws_.d_stage1_doc_scores, ws_.estimated_num_docs * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ws_.d_doc_query_max, ws_.estimated_num_docs * max_q_doclen * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_doc_query_max, ws_.estimated_num_docs * Q_DOCLEN * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ws_.d_num_unique_docs, sizeof(int)));
         
         // Query CUB temporary storage size (dry run)
@@ -331,25 +348,25 @@ struct gpu_mvr_index {
         // Stage 2 workspace
         CUDA_CHECK(cudaMalloc(&ws_.d_token_ids, ws_.max_stage2_tokens * sizeof(size_t)));
         CUDA_CHECK(cudaMalloc(&ws_.d_candidate_offsets, (ws_.max_stage2_candidates + 1) * sizeof(size_t)));
-        CUDA_CHECK(cudaMalloc(&ws_.d_token_dists, ws_.max_stage2_tokens * max_q_doclen * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_token_dists, ws_.max_stage2_tokens * Q_DOCLEN * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ws_.d_doc_scores, ws_.max_stage2_candidates * sizeof(float)));
 
         // Extract workspace
         CUDA_CHECK(cudaMalloc(&ws_.d_selected_indices, ws_.max_stage2_k * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&ws_.d_out_offsets, (ws_.max_stage2_k + 1) * sizeof(size_t)));
-        CUDA_CHECK(cudaMalloc(&ws_.d_out_one_bit_dists, ws_.max_stage2_k_tokens * max_q_doclen * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_out_one_bit_dists, ws_.max_stage2_k_tokens * Q_DOCLEN * sizeof(float)));
 
         // CAGRA batched search workspace
-        CUDA_CHECK(cudaMalloc(&ws_.d_cagra_dists, max_q_doclen * max_nprobe * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&ws_.d_cagra_labels, max_q_doclen * max_nprobe * sizeof(faiss::idx_t)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_cagra_dists, Q_DOCLEN * nprobe * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ws_.d_cagra_labels, Q_DOCLEN * nprobe * sizeof(faiss::idx_t)));
 
         // Pinned host memory
-        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_queries, max_q_doclen * padded_dim_ * sizeof(float)));
-        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_cb1_sumq, max_q_doclen * sizeof(float)));
+        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_queries, Q_DOCLEN * PADDED_DIM * sizeof(float)));
+        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_cb1_sumq, Q_DOCLEN * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_emb_ids, ws_.max_stage1_pairs * sizeof(size_t)));
-        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_pair_offsets, (max_q_doclen + 1) * sizeof(int)));
-        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_dists, ws_.max_stage2_k_tokens * max_q_doclen * sizeof(float)));
-        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_cagra_labels, max_q_doclen * max_nprobe * sizeof(faiss::idx_t)));
+        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_pair_offsets, (Q_DOCLEN + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_dists, ws_.max_stage2_k_tokens * Q_DOCLEN * sizeof(float)));
+        CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_cagra_labels, Q_DOCLEN * nprobe * sizeof(faiss::idx_t)));
         CUDA_CHECK(cudaMallocHost(&ws_.h_pinned_batch_scores, ws_.max_stage2_candidates * sizeof(float)));
 
         // === NEW: Create CUDA streams ===
@@ -393,30 +410,30 @@ struct gpu_mvr_index {
 
     // ======================== SEARCH PIPELINE ========================
 
-    std::vector<size_t> search(const float* queries, size_t q_doclen, size_t k, size_t nprobe) {
+    std::vector<size_t> search(const float* queries, size_t k) {
 
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.event_start, ws_.stream_compute));
 #endif
 
         // Step 1: Rotate queries on CPU into pinned memory (async-ready)
-        for (size_t i = 0; i < q_doclen; ++i) {
-            rotator_->rotate(&queries[i * d], &ws_.h_pinned_queries[i * padded_dim_]);
+        for (size_t i = 0; i < Q_DOCLEN; ++i) {
+            rotator_->rotate(&queries[i * d], &ws_.h_pinned_queries[i * PADDED_DIM]);
         }
 
         // Build query objects on CPU
-        std::vector<query_object> query_objs(q_doclen);
-        for (size_t i = 0; i < q_doclen; ++i) {
-            query_objs[i] = query_object(&ws_.h_pinned_queries[i * padded_dim_], padded_dim_, ex_bits);
+        std::vector<query_object> query_objs(Q_DOCLEN);
+        for (size_t i = 0; i < Q_DOCLEN; ++i) {
+            query_objs[i] = query_object(&ws_.h_pinned_queries[i * PADDED_DIM], PADDED_DIM, ex_bits);
             ws_.h_pinned_cb1_sumq[i] = query_objs[i].cb1_sumq;
         }
 
         // Upload from pinned memory using async stream
         CUDA_CHECK(cudaMemcpyAsync(ws_.d_queries, ws_.h_pinned_queries,
-                                   q_doclen * padded_dim_ * sizeof(float),
+                                   Q_DOCLEN * PADDED_DIM * sizeof(float),
                                    cudaMemcpyHostToDevice, ws_.stream_h2d));
         CUDA_CHECK(cudaMemcpyAsync(ws_.d_cb1_sumq, ws_.h_pinned_cb1_sumq,
-                                   q_doclen * sizeof(float),
+                                   Q_DOCLEN * sizeof(float),
                                    cudaMemcpyHostToDevice, ws_.stream_h2d));
 
         // Wait for H2D transfer before compute
@@ -431,7 +448,7 @@ struct gpu_mvr_index {
 
         // Stage 1: GPU-only aggregation and top-k
         int actual_k_stage1 = 0;
-        rank_cluster_dists_gpu(query_objs.data(), q_doclen, nprobe, k_rank_cluster,
+        rank_cluster_dists_gpu(query_objs.data(), nprobe, k_rank_cluster,
                               actual_k_stage1, ws_.stream_compute);
 
 #ifdef GPU_MVR_PROFILE
@@ -448,10 +465,10 @@ struct gpu_mvr_index {
         // Launch consumer thread for Stage 3 (ex-bits refinement on CPU)
         std::thread consumer_thread(&gpu_mvr_index::stage3_consumer, this,
                                    std::ref(pipeline_queue), query_objs.data(),
-                                   q_doclen, k, std::ref(result));
+                                   k, std::ref(result));
 
         // Run producer (Stage 2: batched 1-bit scoring) on main thread
-        rank_all_tokens_1bit_batched_gpu(q_doclen, actual_k_stage1, k_rank_all_tokens,
+        rank_all_tokens_1bit_batched_gpu(actual_k_stage1, k_rank_all_tokens,
                                          pipeline_queue, ws_.stream_compute);
 
 #ifdef GPU_MVR_PROFILE
@@ -486,7 +503,7 @@ struct gpu_mvr_index {
         std::vector<size_t> stage2_doc_ids;
         std::vector<float>  stage2_one_bit_dists;
 
-        rank_all_tokens_1bit_gpu(q_doclen, actual_k_stage1, k_rank_all_tokens,
+        rank_all_tokens_1bit_gpu(actual_k_stage1, k_rank_all_tokens,
                                  stage2_doc_ids, stage2_one_bit_dists,
                                  ws_.stream_compute);
 
@@ -500,7 +517,7 @@ struct gpu_mvr_index {
         auto stage3_wall_start = std::chrono::high_resolution_clock::now();
 #endif
 
-        rank_all_tokens_exbits_cpu(query_objs.data(), q_doclen,
+        rank_all_tokens_exbits_cpu(query_objs.data(),
                                    stage2_doc_ids, stage2_one_bit_dists,
                                    k, result);
 
@@ -542,7 +559,7 @@ struct gpu_mvr_index {
 
     void rank_cluster_dists_gpu(
         query_object* h_query_objs,
-        size_t q_doclen, size_t nprobe, size_t k,
+        size_t nprobe, size_t k,
         int& actual_k_out,
         cudaStream_t stream = 0
     ) {
@@ -550,18 +567,18 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaEventRecord(ws_.event_cagra_start, stream));
 #endif
 
-        // 1. Batched CAGRA search: one call for all q_doclen queries on GPU
+        // 1. Batched CAGRA search: one call for all Q_DOCLEN queries on GPU
         //    ws_.d_queries is already on GPU from the caller.
-        ivf->search_batch_gpu(ws_.d_queries, q_doclen, nprobe,
+        ivf->search_batch_gpu(ws_.d_queries, Q_DOCLEN, nprobe,
                               ws_.d_cagra_dists, ws_.d_cagra_labels);
 
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.event_cagra_end, stream));
 #endif
 
-        // Copy cluster labels back to CPU (one transfer instead of q_doclen)
+        // Copy cluster labels back to CPU (one transfer instead of Q_DOCLEN)
         CUDA_CHECK(cudaMemcpy(ws_.h_pinned_cagra_labels, ws_.d_cagra_labels,
-                              q_doclen * nprobe * sizeof(faiss::idx_t), cudaMemcpyDeviceToHost));
+                              Q_DOCLEN * nprobe * sizeof(faiss::idx_t), cudaMemcpyDeviceToHost));
 
 #ifdef GPU_MVR_PROFILE
         CUDA_CHECK(cudaEventRecord(ws_.event_stage1_rest_start, stream));
@@ -570,9 +587,9 @@ struct gpu_mvr_index {
         // Expand cluster IDs to embedding IDs via inv_list (CPU - needed for sparse access)
         ws_.h_pinned_pair_offsets[0] = 0;
         size_t total_pairs = 0;
-        std::vector<std::vector<size_t>> per_query_ids(q_doclen);
+        std::vector<std::vector<size_t>> per_query_ids(Q_DOCLEN);
 
-        for (size_t j = 0; j < q_doclen; ++j) {
+        for (size_t j = 0; j < Q_DOCLEN; ++j) {
             for (size_t p = 0; p < nprobe; ++p) {
                 faiss::idx_t cluster_id = ws_.h_pinned_cagra_labels[j * nprobe + p];
                 if (cluster_id < 0) continue;
@@ -592,7 +609,7 @@ struct gpu_mvr_index {
         }
 
         // Flatten into pinned memory contiguously by query
-        for (size_t j = 0; j < q_doclen; ++j) {
+        for (size_t j = 0; j < Q_DOCLEN; ++j) {
             memcpy(&ws_.h_pinned_emb_ids[ws_.h_pinned_pair_offsets[j]],
                    per_query_ids[j].data(),
                    per_query_ids[j].size() * sizeof(size_t));
@@ -602,39 +619,45 @@ struct gpu_mvr_index {
         CUDA_CHECK(cudaMemcpyAsync(ws_.d_emb_ids, ws_.h_pinned_emb_ids,
                                    total_pairs * sizeof(size_t), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(ws_.d_pair_offsets, ws_.h_pinned_pair_offsets,
-                                   (q_doclen + 1) * sizeof(int), cudaMemcpyHostToDevice, stream));
+                                   (Q_DOCLEN + 1) * sizeof(int), cudaMemcpyHostToDevice, stream));
 
-        // 2. Compute 1-bit distances using shared-memory kernel
+        // 2. Compute 1-bit distances using optimized shared-memory kernel
         size_t max_embs_per_query = 0;
-        for (size_t j = 0; j < q_doclen; ++j)
+        for (size_t j = 0; j < Q_DOCLEN; ++j)
             max_embs_per_query = std::max(max_embs_per_query, per_query_ids[j].size());
 
-        int threads_per_block = 256;
+        // OPTIMIZATION: Adaptive thread count based on dimension (compile-time constant now)
+        int threads_per_block = (PADDED_DIM <= 4096) ? 512 : 256;
         int warps_per_block = threads_per_block / 32;
-        int blocks_x = (max_embs_per_query + warps_per_block - 1) / warps_per_block;
-        size_t smem_size = padded_dim_ * sizeof(float);
 
-        dim3 grid(blocks_x, q_doclen);
-        stage1_binary_ip_kernel<<<grid, threads_per_block, smem_size, stream>>>(
+        // Adjust blocks_x for batched processing (EMBS_PER_WARP = 4)
+        constexpr int EMBS_PER_WARP = 4;
+        int blocks_x = (max_embs_per_query + warps_per_block * EMBS_PER_WARP - 1) / (warps_per_block * EMBS_PER_WARP);
+
+        // Occupancy guaranteed at compile-time with SMEM_QUERY_SIZE=512 bytes
+        // No need for runtime check - static shared memory allocation
+
+        dim3 grid(blocks_x, Q_DOCLEN);
+        stage1_binary_ip_kernel_opt<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
-            padded_dim_, q_doclen
+            max_embs_per_query
         );
         CUDA_CHECK(cudaGetLastError());
 
         // === NEW: GPU-only aggregation using atomic operations ===
         // 3. Initialize doc_query_max matrix to 0 (matches original CPU logic)
-        size_t matrix_size = num_docs * q_doclen;
+        size_t matrix_size = num_docs * Q_DOCLEN;
         CUDA_CHECK(cudaMemsetAsync(ws_.d_doc_query_max, 0, matrix_size * sizeof(float), stream));
 
-        // 4. Atomic aggregation: max per (doc, query)
+        // 4. Atomic aggregation: max per (doc, query) - using optimized version
         int thread_count = 256;
         int block_count = (total_pairs + thread_count - 1) / thread_count;
-        
-        aggregate_stage1_atomic_kernel<<<block_count, thread_count, 0, stream>>>(
+
+        aggregate_stage1_atomic_kernel_opt<<<block_count, thread_count, 0, stream>>>(
             ws_.d_emb_ids, ws_.d_emb_dists, ws_.d_pair_offsets, d_doc_ids_,
             ws_.d_doc_query_max,  // doc_query_max matrix
-            q_doclen, num_docs, total_pairs
+            num_docs, total_pairs, max_embs_per_query
         );
         CUDA_CHECK(cudaGetLastError());
 
@@ -643,7 +666,7 @@ struct gpu_mvr_index {
         sum_doc_scores_kernel<<<doc_blocks, thread_count, 0, stream>>>(
             ws_.d_doc_query_max,  // doc_query_max matrix
             ws_.d_stage1_doc_scores,
-            num_docs, q_doclen
+            num_docs
         );
         CUDA_CHECK(cudaGetLastError());
 
@@ -695,7 +718,6 @@ struct gpu_mvr_index {
     // ======================== STAGE 2: GPU ========================
 
     void rank_all_tokens_1bit_gpu(
-        size_t q_doclen,
         int num_candidates,  // from Stage 1
         size_t k,
         std::vector<size_t>& output_ids,
@@ -746,26 +768,23 @@ struct gpu_mvr_index {
         int threads_per_block = 256;
         int warps_per_block = threads_per_block / 32;
         int blocks_x = (total_tokens + warps_per_block - 1) / warps_per_block;
-        size_t smem_size = padded_dim_ * sizeof(float);
 
-        dim3 grid(blocks_x, q_doclen);
-        stage2_binary_ip_kernel<<<grid, threads_per_block, smem_size, stream>>>(
+        dim3 grid(blocks_x, Q_DOCLEN);
+        stage2_binary_ip_kernel<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_token_ids, ws_.d_token_dists,
-            padded_dim_, q_doclen, total_tokens
+            total_tokens
         );
         CUDA_CHECK(cudaGetLastError());
 
         // 5. Compute doc scores with shared-memory reduction
         int score_threads = 128;
-        while (score_threads < (int)q_doclen && score_threads < 256) score_threads *= 2;
+        while (score_threads < Q_DOCLEN && score_threads < 256) score_threads *= 2;
         score_threads = std::min(score_threads, 256);
-        constexpr int TILE_T = 8;
-        size_t score_smem = (q_doclen * (TILE_T + 1) + score_threads) * sizeof(float);
 
-        doc_score_kernel<<<num_candidates, score_threads, score_smem, stream>>>(
+        doc_score_kernel<<<num_candidates, score_threads, 0, stream>>>(
             ws_.d_token_dists, ws_.d_candidate_offsets, ws_.d_doc_scores,
-            q_doclen, total_tokens, num_candidates
+            total_tokens, num_candidates
         );
         CUDA_CHECK(cudaGetLastError());
 
@@ -828,12 +847,12 @@ struct gpu_mvr_index {
         extract_one_bit_dists_kernel<<<actual_k, 256, 0, stream>>>(
             ws_.d_token_dists, ws_.d_candidate_offsets,
             ws_.d_selected_indices, ws_.d_out_one_bit_dists,
-            ws_.d_out_offsets, q_doclen, total_tokens, actual_k
+            ws_.d_out_offsets, total_tokens, actual_k
         );
         CUDA_CHECK(cudaGetLastError());
 
         // 9. Copy only selected dists to pinned host memory
-        size_t copy_size = total_selected_tokens * q_doclen;
+        size_t copy_size = total_selected_tokens * Q_DOCLEN;
         CUDA_CHECK(cudaMemcpyAsync(ws_.h_pinned_dists, ws_.d_out_one_bit_dists,
                                    copy_size * sizeof(float), cudaMemcpyDeviceToHost, stream));
 
@@ -858,7 +877,6 @@ struct gpu_mvr_index {
 
     void rank_all_tokens_exbits_cpu(
         query_object* queries,
-        size_t q_doclen,
         std::vector<size_t>& input_ids,
         std::vector<float>& one_bit_dists,
         size_t k,
@@ -875,19 +893,19 @@ struct gpu_mvr_index {
         for (size_t idx = 0; idx < input_ids.size(); ++idx) {
             size_t doc_id = input_ids[idx];
             float doc_score = 0.0F;
-            for (size_t j = 0; j < q_doclen; ++j) {
+            for (size_t j = 0; j < Q_DOCLEN; ++j) {
                 float max_token_score = -std::numeric_limits<float>::infinity();
                 for (size_t i = 0; i < doc_len(doc_id); ++i) {
                     size_t tid = doc_ptrs_[doc_id] + i;
                     float dist = distance_ex_bits(
                         queries + j,
-                        &ex_code_[tid * padded_dim_ * ex_bits / 8],
+                        &ex_code_[tid * PADDED_DIM * ex_bits / 8],
                         ex_bits,
                         ip_func_,
-                        one_bit_dists[(candidate_doc_ptrs[idx] + i) * q_doclen + j],
+                        one_bit_dists[(candidate_doc_ptrs[idx] + i) * Q_DOCLEN + j],
                         one_bit_factor_[tid],
                         ex_factor_[tid],
-                        padded_dim_
+                        PADDED_DIM
                     );
                     max_token_score = std::max(max_token_score, dist);
                 }
@@ -905,7 +923,7 @@ struct gpu_mvr_index {
     // ======================== PIPELINE: Batched Stage 2 Producer ========================
 
     void rank_all_tokens_1bit_batched_gpu(
-        size_t q_doclen, int num_candidates, size_t k,
+        int num_candidates, size_t k,
         PipelineQueue& queue, cudaStream_t stream
     ) {
         if (num_candidates == 0) {
@@ -996,12 +1014,11 @@ struct gpu_mvr_index {
             // D. 1-bit binary IP
             int tpb = 256, wpb = tpb / 32;
             int bx = (batch_total_tokens + wpb - 1) / wpb;
-            size_t smem = padded_dim_ * sizeof(float);
-            dim3 grid(bx, q_doclen);
-            stage2_binary_ip_kernel<<<grid, tpb, smem, stream>>>(
+            dim3 grid(bx, Q_DOCLEN);
+            stage2_binary_ip_kernel<<<grid, tpb, 0, stream>>>(
                 ws_.d_queries, d_one_bit_code_, d_one_bit_factor_,
                 ws_.d_cb1_sumq, ws_.d_token_ids, ws_.d_token_dists,
-                padded_dim_, q_doclen, batch_total_tokens
+                batch_total_tokens
             );
             CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
@@ -1011,13 +1028,11 @@ struct gpu_mvr_index {
 
             // E. Doc scoring
             int st = 128;
-            while (st < (int)q_doclen && st < 256) st *= 2;
+            while (st < Q_DOCLEN && st < 256) st *= 2;
             st = std::min(st, 256);
-            constexpr int TILE_T = 8;
-            size_t ssm = (q_doclen * (TILE_T + 1) + st) * sizeof(float);
-            doc_score_kernel<<<batch_count, st, ssm, stream>>>(
+            doc_score_kernel<<<batch_count, st, 0, stream>>>(
                 ws_.d_token_dists, ws_.d_candidate_offsets, ws_.d_doc_scores,
-                q_doclen, batch_total_tokens, batch_count
+                batch_total_tokens, batch_count
             );
             CUDA_CHECK(cudaGetLastError());
 #ifdef GPU_MVR_PROFILE
@@ -1102,11 +1117,11 @@ struct gpu_mvr_index {
             extract_one_bit_dists_kernel<<<num_extract, 256, 0, stream>>>(
                 ws_.d_token_dists, ws_.d_candidate_offsets,
                 ws_.d_selected_indices, ws_.d_out_one_bit_dists,
-                ws_.d_out_offsets, q_doclen, batch_total_tokens, num_extract
+                ws_.d_out_offsets, batch_total_tokens, num_extract
             );
             CUDA_CHECK(cudaGetLastError());
 
-            size_t copy_elems = total_extract_tokens * q_doclen;
+            size_t copy_elems = total_extract_tokens * Q_DOCLEN;
             CUDA_CHECK(cudaMemcpyAsync(ws_.h_pinned_dists,
                         ws_.d_out_one_bit_dists,
                         copy_elems * sizeof(float),
@@ -1179,7 +1194,7 @@ struct gpu_mvr_index {
     // ======================== PIPELINE: Stage 3 Consumer ========================
 
     void stage3_consumer(
-        PipelineQueue& queue, query_object* queries, size_t q_doclen,
+        PipelineQueue& queue, query_object* queries,
         size_t k, std::vector<size_t>& output_ids
     ) {
         std::priority_queue<std::pair<float, size_t>> max_heap;
@@ -1193,18 +1208,18 @@ struct gpu_mvr_index {
             for (size_t idx = 0; idx < nbatch; ++idx) {
                 size_t doc_id = batch.doc_ids[idx];
                 float doc_score = 0.0f;
-                for (size_t j = 0; j < q_doclen; ++j) {
+                for (size_t j = 0; j < Q_DOCLEN; ++j) {
                     float max_ts = -std::numeric_limits<float>::infinity();
                     for (size_t i = 0; i < doc_len(doc_id); ++i) {
                         size_t tid = doc_ptrs_[doc_id] + i;
                         float dist = distance_ex_bits(
                             queries + j,
-                            &ex_code_[tid * padded_dim_ * ex_bits / 8],
+                            &ex_code_[tid * PADDED_DIM * ex_bits / 8],
                             ex_bits, ip_func_,
-                            batch.one_bit_dists[(batch.doc_ptrs[idx] + i) * q_doclen + j],
+                            batch.one_bit_dists[(batch.doc_ptrs[idx] + i) * Q_DOCLEN + j],
                             one_bit_factor_[tid],
                             ex_factor_[tid],
-                            padded_dim_
+                            PADDED_DIM
                         );
                         max_ts = std::max(max_ts, dist);
                     }

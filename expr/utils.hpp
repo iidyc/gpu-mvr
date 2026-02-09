@@ -49,7 +49,11 @@ std::vector<std::vector<size_t>> read_gt_tsv(int num_queries, int top_k) {
         int qID = std::stoi(arr[0]);
         size_t itemID = std::stoull(arr[1]);
         int rank = std::stoi(arr[2]);
-        ground_truth[qID][rank] = itemID;
+        if (rank - 1 >= top_k || rank - 1 < 0) {
+            std::cerr << "Warning: Rank " << rank << " exceeds top_k " << top_k << ". Skipping." << std::endl;
+            exit(0); 
+        }
+        ground_truth[qID][rank - 1] = itemID;
     }
     return ground_truth;
 }
