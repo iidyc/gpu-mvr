@@ -110,7 +110,7 @@ struct gpu_mvr_index {
 
     // Search parameters
     int nprobe = 128;
-    int k_rank_cluster = 1800;    
+    int k_rank_cluster = 5000;    
     int k_rank_all_tokens = 300;
 
     // Pre-allocated GPU workspace (sized for worst-case per search)

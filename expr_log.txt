@@ -2,13 +2,17 @@ int nprobe = 128;
 int k_rank_cluster = 1800;    
 int k_rank_all_tokens = 300;
 
-[PROFILE] Total GPU time: 20.7642 ms
-[PROFILE] Stage 1 time: 14.9939 ms
-[PROFILE]   - CAGRA search: 1.51562 ms
-[PROFILE]   - Stage 1 rest: 13.4592 ms
-[PROFILE] Stage 2 time: 4.58413 ms
-[PROFILE] Stage 3 time: 1.13171 ms (300 docs)
-Recall@100: 0.952
+V100
+[PROFILE] Total GPU time: 10.8433 ms
+[PROFILE] Stage 1 time: 7.46736 ms
+[PROFILE]   - CAGRA search: 0.622272 ms
+[PROFILE]   - Stage 1 rest: 6.81354 ms
+[PROFILE] Stage 2 time: 1.57248 ms
+[PROFILE] Stage 3 time: 1.72409 ms (300 docs)
 
-Total search time for 2931 queries: 201.08 seconds (68.6 ms/q)
+[33.1667 s] GPU search time for 2931 queries. (11.3 ms/q)
+Recall@100: 0.951539
+
+
+Total search time for 2931 queries: 106.72 seconds (36.4 ms/q)
 Recall@100: 95.0720

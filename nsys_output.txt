@@ -1,0 +1,121 @@
+[3/8] Executing 'nvtx_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances  Avg (ns)  Med (ns)  Min (ns)  Max (ns)   StdDev (ns)   Style             Range          
+ --------  ---------------  ---------  --------  --------  --------  ---------  -----------  -------  -------------------------
+     80.8      444,988,647      5,862  75,910.7  69,056.5    57,597  3,583,238     56,331.0  PushPop  CCCL:cub::DeviceRadixSort
+     19.2      105,720,847      5,862  18,034.9   8,410.0     6,714    444,785     36,827.3  PushPop  CCCL:cub::DeviceFor::Bulk
+
+[4/8] Executing 'osrt_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls     Avg (ns)        Med (ns)     Min (ns)    Max (ns)       StdDev (ns)             Name         
+ --------  ---------------  ---------  ---------------  -------------  --------  -------------  ---------------  ----------------------
+     72.7  124,349,071,840         63  1,973,794,791.1   19,048,321.0   453,259  4,045,994,173  2,010,461,386.8  pthread_cond_wait     
+     23.3   39,844,678,185        410     97,182,141.9  100,183,574.5    17,444    363,722,475     22,555,979.4  poll                  
+      3.6    6,077,117,460     12,419        489,340.3        2,735.0     1,045    839,201,437     15,950,299.1  read                  
+      0.2      349,076,947          7     49,868,135.3    1,157,494.0     8,993    231,852,626     90,631,237.4  fread                 
+      0.2      346,750,028        989        350,606.7       18,288.0     1,000    132,666,929      4,868,542.3  ioctl                 
+      0.0       67,730,050         43      1,575,117.4        7,191.0     2,965     45,044,268      7,513,810.8  mmap                  
+      0.0       17,511,860         33        530,662.4      606,674.0   274,530        758,855        166,462.0  pthread_create        
+      0.0        4,662,149         44        105,957.9        4,234.0     1,474        929,013        225,983.7  fopen                 
+      0.0        3,917,629         46         85,165.8        9,860.0     7,714      2,790,541        409,492.6  mmap64                
+      0.0        2,542,018          2      1,271,009.0    1,271,009.0   269,873      2,272,145      1,415,820.1  pthread_rwlock_wrlock 
+      0.0        2,309,162         14        164,940.1      178,278.5    81,230        234,087         51,527.5  sem_timedwait         
+      0.0          468,813         72          6,511.3        5,525.0     1,602         17,115          3,208.4  open64                
+      0.0          392,128         62          6,324.6        4,658.0     1,403         19,337          4,874.2  pthread_cond_signal   
+      0.0          288,316         42          6,864.7        5,571.5     2,917         19,686          3,816.2  munmap                
+      0.0          184,986          1        184,986.0      184,986.0   184,986        184,986              0.0  pthread_rwlock_rdlock 
+      0.0          126,790         37          3,426.8        1,862.0     1,233         13,488          3,246.0  fclose                
+      0.0           79,519          4         19,879.8       11,079.5     4,637         52,723         22,218.3  putc                  
+      0.0           64,255          1         64,255.0       64,255.0    64,255         64,255              0.0  fgets                 
+      0.0           43,294         20          2,164.7        1,205.0     1,006         16,758          3,468.6  fcntl                 
+      0.0           37,983         15          2,532.2        2,343.0     2,085          3,687            487.0  write                 
+      0.0           31,079          6          5,179.8        5,685.0     2,210          7,968          2,040.4  open                  
+      0.0           21,570          5          4,314.0        3,310.0     1,491          9,278          3,197.1  fwrite                
+      0.0           20,511          2         10,255.5       10,255.5     7,047         13,464          4,537.5  pthread_cond_broadcast
+      0.0           20,039          3          6,679.7        8,284.0     3,393          8,362          2,846.6  pipe2                 
+      0.0           16,872          2          8,436.0        8,436.0     6,078         10,794          3,334.7  socket                
+      0.0           10,170          1         10,170.0       10,170.0    10,170         10,170              0.0  connect               
+      0.0            4,214          2          2,107.0        2,107.0     1,117          3,097          1,400.1  sigaction             
+      0.0            4,132          1          4,132.0        4,132.0     4,132          4,132              0.0  ftruncate             
+      0.0            3,453          3          1,151.0        1,122.0     1,024          1,307            143.7  dup                   
+      0.0            2,557          1          2,557.0        2,557.0     2,557          2,557              0.0  bind                  
+      0.0            1,679          1          1,679.0        1,679.0     1,679          1,679              0.0  listen                
+
+[5/8] Executing 'cuda_api_sum' stats report
+
+ Time (%)  Total Time (ns)  Num Calls    Avg (ns)       Med (ns)      Min (ns)     Max (ns)    StdDev (ns)                 Name               
+ --------  ---------------  ---------  -------------  -------------  -----------  -----------  ------------  ---------------------------------
+     59.0   10,626,308,545     17,586      604,248.2       10,239.0        1,307   14,954,588     807,252.4  cudaStreamSynchronize            
+     19.7    3,554,922,457      8,797      404,106.2       28,747.0       17,573  921,588,387  11,988,698.8  cudaMemcpy                       
+      8.7    1,565,770,326     20,556       76,171.0        5,625.0        2,280    3,719,141     175,925.5  cudaFree                         
+      4.1      730,951,271     32,242       22,670.8        6,941.0        3,339  114,186,747     638,408.9  cudaMemcpyAsync                  
+      2.1      382,258,263     73,275        5,216.8        4,437.0        3,344      466,182       3,391.9  cudaLaunchKernel                 
+      1.6      286,613,608          1  286,613,608.0  286,613,608.0  286,613,608  286,613,608           0.0  cudaMallocHost                   
+      1.3      235,817,115          1  235,817,115.0  235,817,115.0  235,817,115  235,817,115           0.0  cudaMemcpy2DAsync                
+      1.0      181,333,302     38,104        4,758.9        4,278.5        2,515    4,038,587      20,792.6  cudaMemsetAsync                  
+      0.8      140,360,872     20,555        6,828.6        5,731.0        1,947      509,715       7,496.7  cudaMalloc                       
+      0.5       95,699,004      8,794       10,882.3        7,302.5        5,830    5,118,490      54,856.5  cudaLaunchKernel_ptsz            
+      0.4       76,486,647          7   10,926,663.9       12,842.0        7,089   51,167,342  19,809,705.4  cudaFreeHost                     
+      0.4       69,474,554          7    9,924,936.3       17,534.0        5,915   64,522,769  24,112,021.4  cudaHostAlloc                    
+      0.1       24,858,574      2,931        8,481.3        8,012.0        7,067      226,583       4,947.6  cudaEventRecord                  
+      0.1       12,985,146      2,949        4,403.2        3,476.0          297    2,320,141      42,666.8  cudaEventDestroy                 
+      0.1       11,863,527          1   11,863,527.0   11,863,527.0   11,863,527   11,863,527           0.0  cudaMallocAsync_ptsz_v11020      
+      0.1       10,664,104      2,931        3,638.4        3,368.0        2,807      283,297       5,275.9  cudaEventCreate                  
+      0.1        9,022,677      2,931        3,078.4        2,956.0        2,595       13,346         883.3  cudaStreamWaitEvent              
+      0.0          372,801          2      186,400.5      186,400.5      160,756      212,045      36,266.8  cudaGetDeviceProperties_v2_v12000
+      0.0          163,070          7       23,295.7        6,449.0        4,200      121,418      43,398.9  cudaStreamDestroy                
+      0.0          147,340        810          181.9          127.0           72        2,914         178.2  cuGetProcAddress_v2              
+      0.0           74,104          4       18,526.0        3,796.5        2,759       63,752      30,157.0  cudaStreamCreateWithFlags        
+      0.0           22,401          1       22,401.0       22,401.0       22,401       22,401           0.0  cudaMemGetInfo                   
+      0.0           21,442          3        7,147.3        3,508.0        3,374       14,560       6,419.9  cudaStreamCreate                 
+      0.0           20,215         18        1,123.1          325.0          291        9,688       2,263.8  cudaEventCreateWithFlags         
+      0.0           13,210          4        3,302.5        2,858.0        1,536        5,958       1,942.8  cudaDeviceSynchronize            
+      0.0            7,199          3        2,399.7        2,426.0        2,181        2,592         206.8  cuInit                           
+      0.0            5,036          1        5,036.0        5,036.0        5,036        5,036           0.0  cudaFreeAsync_ptsz_v11020        
+      0.0            1,382          3          460.7          155.0          154        1,073         530.3  cuModuleGetLoadingMode           
+      0.0            1,369          2          684.5          684.5          410          959         388.2  cudaGetDriverEntryPoint_v11030   
+
+[6/8] Executing 'cuda_gpu_kern_sum' stats report
+
+ Time (%)  Total Time (ns)  Instances  Avg (ns)   Med (ns)   Min (ns)  Max (ns)   StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  ---------  ---------  --------  ---------  -----------  ----------------------------------------------------------------------------------------------------
+     24.7    2,535,593,066      2,931  865,094.9  853,849.0   796,921  1,076,567     45,956.3  sum_doc_scores_kernel(const float *, float *, unsigned long)                                        
+     24.2    2,490,804,385      2,931  849,813.8  854,072.0   524,411  1,035,255     78,567.6  stage2_binary_ip_kernel_v2(const float *, const char *, const float *, const float *, const unsigne…
+     13.6    1,394,715,723      2,931  475,849.8  475,484.0   444,444    511,324     10,201.6  void cuvs::neighbors::cagra::detail::multi_cta_search::search_kernel<(unsigned int)128, cuvs::neigh…
+     12.3    1,259,342,532     11,724  107,415.8   97,823.0    74,527    149,983     23,982.3  void cub::detail::radix_sort::DeviceRadixSortOnesweepKernel<cub::detail::radix::policy_hub<float, i…
+      6.8      703,891,703      2,931  240,154.1  241,726.0   137,022    302,077     27,490.9  doc_score_kernel(const float *, const unsigned long *, float *, unsigned long, unsigned long)       
+      6.0      613,275,275      2,931  209,237.6  207,486.0    76,064    363,037     46,371.1  aggregate_stage1_atomic_kernel_opt(const unsigned long *, const float *, const int *, const int *, …
+      5.2      534,396,881      2,931  182,325.8  180,254.0   122,015    256,606     21,716.0  stage1_binary_ip_kernel_v2(const float *, const char *, const float *, const float *, const unsigne…
+      3.6      368,729,926     11,724   31,450.9   21,824.0    21,152     61,344     16,744.5  void cub::detail::radix_sort::DeviceRadixSortOnesweepKernel<cub::detail::radix::policy_hub<float, i…
+      0.8       86,692,272      2,931   29,577.7   29,535.0    27,904     32,448        694.5  void cub::detail::radix_sort::DeviceRadixSortHistogramKernel<cub::detail::radix::policy_hub<float, …
+      0.7       69,362,823      2,931   23,665.2   23,808.0    15,680     28,415      1,681.9  extract_one_bit_dists_kernel(const float *, const unsigned long *, const int *, float *, const unsi…
+      0.5       54,520,333      2,931   18,601.3   19,168.0    14,656     19,712      1,167.8  void cuvs::neighbors::cagra::detail::kern_topk_cta_11<(int)8, (int)2, (int)128, (int)32, unsigned i…
+      0.4       38,344,919      5,862    6,541.3    6,512.0     1,920     11,808      4,549.0  void cub::detail::for_each::static_kernel<cub::detail::for_each::policy_hub_t::policy_500_t, long, …
+      0.4       36,461,736      2,931   12,440.0   12,255.0    12,096     13,984        422.8  void cub::detail::radix_sort::DeviceRadixSortHistogramKernel<cub::detail::radix::policy_hub<float, …
+      0.3       33,839,410      2,931   11,545.3   11,616.0    10,048     12,864        492.9  gather_token_ids_kernel(const int *, const int *, const unsigned long *, unsigned long *, unsigned …
+      0.2       16,464,821      2,931    5,617.5    5,600.0     4,000      6,175        119.8  void cub::detail::scan::DeviceScanKernel<cub::detail::scan::policy_hub<int, unsigned long, int, uns…
+      0.1        9,548,371      2,931    3,257.7    3,296.0     2,688      4,032        206.2  gather_doc_lengths_kernel(const int *, const int *, int *, unsigned long)                           
+      0.1        7,835,736      2,931    2,673.4    2,656.0     2,400      2,944         61.5  void cuvs::neighbors::cagra::detail::multi_cta_search::set_value_batch_kernel<unsigned int>(T1 *, u…
+      0.1        7,168,193      2,931    2,445.6    2,432.0     2,112      2,944        138.9  void cub::detail::radix_sort::DeviceRadixSortExclusiveSumKernel<cub::detail::radix::policy_hub<floa…
+      0.1        7,102,525      2,931    2,423.2    2,304.0     1,984      7,712        686.3  void cub::detail::transform::transform_kernel<cub::detail::transform::policy_hub<(bool)1, cuda::std…
+      0.1        5,833,514      2,931    1,990.3    1,984.0     1,792      2,176         43.8  void cub::detail::radix_sort::DeviceRadixSortExclusiveSumKernel<cub::detail::radix::policy_hub<floa…
+      0.0        4,355,806      2,931    1,486.1    1,472.0     1,344      1,664         30.0  void cub::detail::scan::DeviceScanInitKernel<cub::ScanTileState<int, (bool)1>>(T1, int)             
+      0.0            2,208          1    2,208.0    2,208.0     2,208      2,208          0.0  void cuvs::neighbors::cagra::detail::standard_dataset_descriptor_init_kernel<(cuvsDistanceType)0, (…
+
+[7/8] Executing 'cuda_gpu_mem_time_sum' stats report
+
+ Time (%)  Total Time (ns)  Count   Avg (ns)   Med (ns)  Min (ns)   Max (ns)    StdDev (ns)            Operation           
+ --------  ---------------  ------  ---------  --------  --------  -----------  -----------  ------------------------------
+     58.4    3,727,343,921  20,523  181,617.9   1,952.0       640  921,420,206  8,055,946.4  [CUDA memcpy Host-to-Device]  
+     24.8    1,585,157,763  17,586   90,137.5   3,552.0     1,280      660,282    195,917.7  [CUDA memcpy Device-to-Host]  
+     16.6    1,060,945,997  38,104   27,843.4   1,120.0       639    1,200,502     92,251.6  [CUDA memset]                 
+      0.1        6,237,042   2,931    2,128.0   2,144.0     1,696        2,336        102.6  [CUDA memcpy Device-to-Device]
+
+[8/8] Executing 'cuda_gpu_mem_size_sum' stats report
+
+ Total (MB)   Count   Avg (MB)  Med (MB)  Min (MB)  Max (MB)   StdDev (MB)            Operation           
+ -----------  ------  --------  --------  --------  ---------  -----------  ------------------------------
+ 914,835.267  38,104    24.009     0.004     0.000  1,073.742       82.999  [CUDA memset]                 
+  22,832.236  20,523     1.113     0.001     0.000  4,259.288       32.667  [CUDA memcpy Host-to-Device]  
+  13,769.738  17,586     0.783     0.026     0.000      5.796        1.720  [CUDA memcpy Device-to-Host]  
+      58.620   2,931     0.020     0.020     0.020      0.020        0.000  [CUDA memcpy Device-to-Device]
