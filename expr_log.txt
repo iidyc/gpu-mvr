@@ -1,0 +1,14 @@
+int nprobe = 128;
+int k_rank_cluster = 1800;    
+int k_rank_all_tokens = 300;
+
+[PROFILE] Total GPU time: 20.7642 ms
+[PROFILE] Stage 1 time: 14.9939 ms
+[PROFILE]   - CAGRA search: 1.51562 ms
+[PROFILE]   - Stage 1 rest: 13.4592 ms
+[PROFILE] Stage 2 time: 4.58413 ms
+[PROFILE] Stage 3 time: 1.13171 ms (300 docs)
+Recall@100: 0.952
+
+Total search time for 2931 queries: 201.08 seconds (68.6 ms/q)
+Recall@100: 95.0720

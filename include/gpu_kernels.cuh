@@ -89,6 +89,39 @@ __device__ __forceinline__ float compute_binary_ip_partial_opt(
 }
 
 // ============================================================================
+// Thread-level binary inner product — each thread computes a full IP
+// ============================================================================
+
+/**
+ * Compute binary IP between a query in shared memory and a binary code,
+ * entirely within a single thread (no warp cooperation / reduction needed).
+ *
+ * Each thread iterates over all PADDED_DIM bits. When all threads in a warp
+ * process different embeddings against the SAME query, they all read
+ * smem_query[pos] at the same address → shared memory broadcast (zero bank
+ * conflicts). This gives 32× more memory-level parallelism for global code
+ * loads per warp compared to the warp-cooperative approach.
+ */
+__device__ __forceinline__ float compute_binary_ip_thread(
+    const float* __restrict__ smem_query,  // [PADDED_DIM] in shared memory
+    const uint64_t* __restrict__ code_ptr  // binary code in global memory
+) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int blk = 0; blk < NUM_U64; blk++) {
+        uint64_t bits = code_ptr[blk];
+        int base = blk * 64;
+        // Iterate all 64 bits. Compiler emits LDS (broadcast) + predicated FADD.
+        #pragma unroll
+        for (int i = 0; i < 64; i++) {
+            if ((bits >> i) & 1ULL)
+                sum += smem_query[base + i];
+        }
+    }
+    return sum;
+}
+
+// ============================================================================
 // Stage 1: Binary IP kernel with shared memory query caching
 // ============================================================================
 
@@ -149,21 +182,13 @@ __global__ void stage1_binary_ip_kernel(
 }
 
 // ============================================================================
-// Stage 1 OPTIMIZED: Warp-cooperative batched processing (8-10x speedup)
+// Stage 1 OPTIMIZED: Warp-cooperative batched processing
 // ============================================================================
 
 /**
- * Optimized version of stage1_binary_ip_kernel with:
- * - Warp-cooperative batched processing: each warp processes EMBS_PER_WARP embeddings per iteration
- * - Multiple lanes write output (4-8x better write efficiency)
- * - Output layout reorganization: [query][embedding] for L2 cache coalescing
- * - Uses optimized compute_binary_ip_partial_opt with unrolling and pipelining
- *
- * Grid: (blocks_x, Q_DOCLEN). Each y-slice handles one query.
- * Output layout: [query][embedding] — d_out_dists[query_idx * max_embs_per_query + w]
- * Adjacent warps write to adjacent addresses for better L2 cache coalescing.
- *
- * Expected speedup: 8-10x over original kernel
+ * Legacy warp-cooperative version (kept for A/B comparison).
+ * Each warp processes EMBS_PER_WARP=4 embeddings per iteration using
+ * warp-reduction. Replaced by stage1_binary_ip_kernel_v2 below.
  */
 __global__ void stage1_binary_ip_kernel_opt(
     const float* __restrict__ d_queries,
@@ -173,14 +198,13 @@ __global__ void stage1_binary_ip_kernel_opt(
     const size_t* __restrict__ d_emb_ids,
     const int*   __restrict__ d_pair_offsets,
     float* __restrict__ d_out_dists,
-    size_t max_embs_per_query  // for [query][embedding] layout
+    size_t max_embs_per_query
 ) {
-    __shared__ float smem_query[PADDED_DIM];  // Static shared memory: 512 bytes
+    __shared__ float smem_query[PADDED_DIM];
 
     int query_idx = blockIdx.y;
     if (query_idx >= Q_DOCLEN) return;
 
-    // Coalesced load: adjacent threads load adjacent floats
     const float* q_ptr = d_queries + query_idx * PADDED_DIM;
     #pragma unroll
     for (int i = threadIdx.x; i < PADDED_DIM; i += blockDim.x) {
@@ -197,7 +221,6 @@ __global__ void stage1_binary_ip_kernel_opt(
     const int warp_local_id = threadIdx.x >> 5;
     const int warps_per_block = blockDim.x >> 5;
 
-    // OPTIMIZATION: Process multiple embeddings per warp iteration
     constexpr int EMBS_PER_WARP = 4;
     float results[EMBS_PER_WARP];
     size_t emb_ids_local[EMBS_PER_WARP];
@@ -207,32 +230,22 @@ __global__ void stage1_binary_ip_kernel_opt(
          w_base += (size_t)warps_per_block * gridDim.x * EMBS_PER_WARP)
     {
         int valid_count = 0;
-
-        // Load embedding IDs for batch (cooperative across warp)
         #pragma unroll
         for (int e = 0; e < EMBS_PER_WARP; ++e) {
             size_t w = w_base + e;
             if (w < num_embs) {
-                // Lane 0 loads, broadcast to all lanes
                 if (lane == 0) emb_ids_local[e] = d_emb_ids[pair_start + w];
                 emb_ids_local[e] = __shfl_sync(0xffffffff, emb_ids_local[e], 0);
                 valid_count++;
             }
         }
-
-        // Compute all embeddings in batch (better register reuse)
         #pragma unroll
         for (int e = 0; e < valid_count; ++e) {
             const uint64_t* code_ptr = (const uint64_t*)(d_one_bit_code + emb_ids_local[e] * CODE_BYTES);
-
-            // Use optimized version with pipelining and unrolling
             float partial = compute_binary_ip_partial_opt(smem_query, code_ptr, lane);
             float ip = warp_reduce_sum(partial);
             results[e] = (ip - cb1_sumq) * d_one_bit_factor[emb_ids_local[e]];
         }
-
-        // OPTIMIZATION: Cooperative write using multiple lanes
-        // [query][embedding] layout: adjacent warps write adjacent addresses
         if (lane < valid_count) {
             size_t out_idx = query_idx * max_embs_per_query + w_base + lane;
             d_out_dists[out_idx] = results[lane];
@@ -241,18 +254,76 @@ __global__ void stage1_binary_ip_kernel_opt(
 }
 
 // ============================================================================
-// Stage 2: Binary IP kernel — writes in [query][token] layout for coalescing
+// Stage 1 v2: Thread-level parallelism (replaces warp-cooperative approach)
 // ============================================================================
 
 /**
- * Grid: (blocks_x, Q_DOCLEN). Each y-slice handles one query.
- * Loads query into shared memory; warps process different tokens.
+ * High-parallelism binary IP kernel for Stage 1.
  *
- * Output layout: [query][token] — d_out_dists[query_idx * total_tokens + tok_idx]
- * This ensures that adjacent warps (processing consecutive tok_idx within the same
- * query block) write to adjacent addresses, maximizing L2 write coalescing.
+ * Key change: each THREAD independently computes one full binary IP
+ * (no warp reduction). This yields 32× more embeddings in flight per
+ * warp, dramatically improving latency hiding for scattered global
+ * memory accesses to binary codes via d_emb_ids.
  *
- * (Previous [token][query] layout had adjacent warps writing addresses Q_DOCLEN apart.)
+ * Grid: (blocks_x, Q_DOCLEN).  Block: 256 threads.
+ * Each block processes 256 embeddings per grid-stride iteration.
+ * Output layout: [query][embedding] — same as stage1_binary_ip_kernel_opt.
+ *
+ * Shared memory broadcast: all threads in a warp iterate the same bit
+ * position, loading smem_query[pos] at the same address → hardware
+ * broadcast, zero bank conflicts.
+ */
+__global__ void stage1_binary_ip_kernel_v2(
+    const float* __restrict__ d_queries,
+    const char*  __restrict__ d_one_bit_code,
+    const float* __restrict__ d_one_bit_factor,
+    const float* __restrict__ d_cb1_sumq,
+    const size_t* __restrict__ d_emb_ids,
+    const int*   __restrict__ d_pair_offsets,
+    float* __restrict__ d_out_dists,
+    size_t max_embs_per_query
+) {
+    __shared__ float smem_query[PADDED_DIM];  // 512 bytes
+
+    const int query_idx = blockIdx.y;
+    if (query_idx >= Q_DOCLEN) return;
+
+    // Coalesced load of query vector into shared memory
+    const float* q_ptr = d_queries + query_idx * PADDED_DIM;
+    #pragma unroll
+    for (int i = threadIdx.x; i < PADDED_DIM; i += blockDim.x) {
+        smem_query[i] = q_ptr[i];
+    }
+    __syncthreads();
+
+    const float cb1_sumq = d_cb1_sumq[query_idx];
+    const size_t pair_start = d_pair_offsets[query_idx];
+    const size_t pair_end   = d_pair_offsets[query_idx + 1];
+    const size_t num_embs   = pair_end - pair_start;
+
+    // Grid-stride loop: each thread handles one embedding per iteration
+    for (size_t idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+         idx < num_embs;
+         idx += (size_t)blockDim.x * gridDim.x)
+    {
+        const size_t emb_id = d_emb_ids[pair_start + idx];
+        const uint64_t* code_ptr =
+            (const uint64_t*)(d_one_bit_code + emb_id * CODE_BYTES);
+
+        float ip = compute_binary_ip_thread(smem_query, code_ptr);
+        float dist = (ip - cb1_sumq) * d_one_bit_factor[emb_id];
+
+        d_out_dists[query_idx * max_embs_per_query + idx] = dist;
+    }
+}
+
+// ============================================================================
+// Stage 2: Binary IP kernel (legacy) — kept for A/B comparison
+// ============================================================================
+
+/**
+ * Legacy version: 2D grid (blocks_x, Q_DOCLEN), each y-slice handles one query.
+ * Each warp processes one token. Replaced by stage2_binary_ip_kernel_v2 below.
  */
 __global__ void stage2_binary_ip_kernel(
     const float* __restrict__ d_queries,
@@ -260,10 +331,10 @@ __global__ void stage2_binary_ip_kernel(
     const float* __restrict__ d_one_bit_factor,
     const float* __restrict__ d_cb1_sumq,
     const size_t* __restrict__ d_token_ids,
-    float* __restrict__ d_out_dists,       // layout: [query][token]
+    float* __restrict__ d_out_dists,
     size_t total_tokens
 ) {
-    __shared__ float smem_query[PADDED_DIM];  // Static shared memory: 512 bytes
+    __shared__ float smem_query[PADDED_DIM];
 
     int query_idx = blockIdx.y;
     if (query_idx >= Q_DOCLEN) return;
@@ -286,14 +357,100 @@ __global__ void stage2_binary_ip_kernel(
     {
         size_t token_id = d_token_ids[tok_idx];
         const uint64_t* code_ptr = (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
-
         float partial = compute_binary_ip_partial(smem_query, code_ptr, lane);
         float ip = warp_reduce_sum(partial);
-
         if (lane == 0) {
-            // [query][token] layout: adjacent tok_idx → adjacent addresses
             d_out_dists[query_idx * total_tokens + tok_idx] =
                 (ip - cb1_sumq) * d_one_bit_factor[token_id];
+        }
+    }
+}
+
+// ============================================================================
+// Stage 2 v2: Multi-query fusion + thread-level parallelism
+// ============================================================================
+
+/**
+ * High-parallelism binary IP kernel for Stage 2.
+ *
+ * Two key changes vs. the legacy kernel:
+ *  1. Multi-query fusion: all Q_DOCLEN=32 query vectors are loaded into
+ *     shared memory and each thread scores ONE token against ALL 32 queries.
+ *     The binary code + factor are loaded from global memory ONCE per token
+ *     instead of 32 times (one per query-slice in the old 2D grid).
+ *  2. Thread-level IP: each thread independently computes the full 128-bit
+ *     binary IP (no warp reduction), giving 32× more tokens in flight per
+ *     warp for better latency hiding.
+ *
+ * Grid: 1D — blocks_x = ceil(total_tokens / blockDim.x).  Block: 256.
+ * Shared memory: Q_DOCLEN * PADDED_DIM * sizeof(float) = 32*128*4 = 16 KB.
+ *
+ * Output layout: [query][token] — preserved for downstream compatibility.
+ * Write coalescing: for a fixed query q, adjacent threads (consecutive
+ * tok_idx) write to contiguous addresses q*total_tokens + tok_idx.
+ */
+__global__ void stage2_binary_ip_kernel_v2(
+    const float* __restrict__ d_queries,       // [Q_DOCLEN * PADDED_DIM]
+    const char*  __restrict__ d_one_bit_code,  // [n * CODE_BYTES]
+    const float* __restrict__ d_one_bit_factor,// [n]
+    const float* __restrict__ d_cb1_sumq,      // [Q_DOCLEN]
+    const size_t* __restrict__ d_token_ids,    // [total_tokens]
+    float* __restrict__ d_out_dists,           // [Q_DOCLEN * total_tokens]
+    size_t total_tokens
+) {
+    // Load ALL query vectors into shared memory (16 KB)
+    __shared__ float smem_queries[Q_DOCLEN * PADDED_DIM];
+    // Cache cb1_sumq in shared memory to avoid repeated global reads (128 B)
+    __shared__ float smem_cb1_sumq[Q_DOCLEN];
+
+    // Cooperative load: 256 threads load 32*128 = 4096 floats → 16 iterations
+    const int total_query_floats = Q_DOCLEN * PADDED_DIM;
+    for (int i = threadIdx.x; i < total_query_floats; i += blockDim.x) {
+        smem_queries[i] = d_queries[i];
+    }
+    if (threadIdx.x < Q_DOCLEN) {
+        smem_cb1_sumq[threadIdx.x] = d_cb1_sumq[threadIdx.x];
+    }
+    __syncthreads();
+
+    // Grid-stride loop: each thread processes one token against all queries
+    for (size_t tok_idx = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+         tok_idx < total_tokens;
+         tok_idx += (size_t)blockDim.x * gridDim.x)
+    {
+        // Load binary code and factor ONCE per token
+        const size_t token_id = d_token_ids[tok_idx];
+        const uint64_t* code_ptr =
+            (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
+        const float factor = d_one_bit_factor[token_id];
+
+        // Pre-load the binary code into registers
+        uint64_t code_regs[NUM_U64];
+        #pragma unroll
+        for (int blk = 0; blk < NUM_U64; blk++) {
+            code_regs[blk] = code_ptr[blk];
+        }
+
+        // Score against all Q_DOCLEN queries
+        #pragma unroll
+        for (int q = 0; q < Q_DOCLEN; q++) {
+            const float* q_smem = smem_queries + q * PADDED_DIM;
+            const float cb1_sumq = smem_cb1_sumq[q];
+
+            float ip = 0.0f;
+            #pragma unroll
+            for (int blk = 0; blk < NUM_U64; blk++) {
+                uint64_t bits = code_regs[blk];
+                int base = blk * 64;
+                #pragma unroll
+                for (int i = 0; i < 64; i++) {
+                    if ((bits >> i) & 1ULL)
+                        ip += q_smem[base + i];
+                }
+            }
+
+            d_out_dists[q * total_tokens + tok_idx] =
+                (ip - cb1_sumq) * factor;
         }
     }
 }

@@ -111,7 +111,7 @@ struct gpu_mvr_index {
     // Search parameters
     int nprobe = 128;
     int k_rank_cluster = 1800;    
-    int k_rank_all_tokens = 1800;
+    int k_rank_all_tokens = 300;
 
     // Pre-allocated GPU workspace (sized for worst-case per search)
     struct Workspace {
@@ -626,19 +626,12 @@ struct gpu_mvr_index {
         for (size_t j = 0; j < Q_DOCLEN; ++j)
             max_embs_per_query = std::max(max_embs_per_query, per_query_ids[j].size());
 
-        // OPTIMIZATION: Adaptive thread count based on dimension (compile-time constant now)
-        int threads_per_block = (PADDED_DIM <= 4096) ? 512 : 256;
-        int warps_per_block = threads_per_block / 32;
-
-        // Adjust blocks_x for batched processing (EMBS_PER_WARP = 4)
-        constexpr int EMBS_PER_WARP = 4;
-        int blocks_x = (max_embs_per_query + warps_per_block * EMBS_PER_WARP - 1) / (warps_per_block * EMBS_PER_WARP);
-
-        // Occupancy guaranteed at compile-time with SMEM_QUERY_SIZE=512 bytes
-        // No need for runtime check - static shared memory allocation
+        // Thread-level parallelism: each thread processes one embedding independently
+        int threads_per_block = 256;
+        int blocks_x = (max_embs_per_query + threads_per_block - 1) / threads_per_block;
 
         dim3 grid(blocks_x, Q_DOCLEN);
-        stage1_binary_ip_kernel_opt<<<grid, threads_per_block, 0, stream>>>(
+        stage1_binary_ip_kernel_v2<<<grid, threads_per_block, 0, stream>>>(
             ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_emb_ids, ws_.d_pair_offsets, ws_.d_emb_dists,
             max_embs_per_query
@@ -764,13 +757,11 @@ struct gpu_mvr_index {
         );
         CUDA_CHECK(cudaGetLastError());
 
-        // 4. Compute all (query, token) 1-bit distances with shared-memory kernel
+        // 4. Compute all (query, token) 1-bit distances — multi-query fused kernel
         int threads_per_block = 256;
-        int warps_per_block = threads_per_block / 32;
-        int blocks_x = (total_tokens + warps_per_block - 1) / warps_per_block;
+        int blocks_x = (total_tokens + threads_per_block - 1) / threads_per_block;
 
-        dim3 grid(blocks_x, Q_DOCLEN);
-        stage2_binary_ip_kernel<<<grid, threads_per_block, 0, stream>>>(
+        stage2_binary_ip_kernel_v2<<<blocks_x, threads_per_block, 0, stream>>>(
             ws_.d_queries, d_one_bit_code_, d_one_bit_factor_, ws_.d_cb1_sumq,
             ws_.d_token_ids, ws_.d_token_dists,
             total_tokens
@@ -1011,11 +1002,10 @@ struct gpu_mvr_index {
 #ifdef GPU_MVR_PROFILE
             CUDA_CHECK(cudaEventRecord(ws_.s2_binaryip_start, stream));
 #endif
-            // D. 1-bit binary IP
-            int tpb = 256, wpb = tpb / 32;
-            int bx = (batch_total_tokens + wpb - 1) / wpb;
-            dim3 grid(bx, Q_DOCLEN);
-            stage2_binary_ip_kernel<<<grid, tpb, 0, stream>>>(
+            // D. 1-bit binary IP — multi-query fused kernel
+            int tpb = 256;
+            int bx = (batch_total_tokens + tpb - 1) / tpb;
+            stage2_binary_ip_kernel_v2<<<bx, tpb, 0, stream>>>(
                 ws_.d_queries, d_one_bit_code_, d_one_bit_factor_,
                 ws_.d_cb1_sumq, ws_.d_token_ids, ws_.d_token_dists,
                 batch_total_tokens
