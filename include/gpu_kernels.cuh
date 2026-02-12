@@ -40,19 +40,23 @@ __global__ void stage1_binary_ip_kernel_v2(
          idx += (size_t)blockDim.x * gridDim.x)
     {
         const size_t emb_id = d_emb_ids[pair_start + idx];
+        // Vectorized 128-bit load of binary code (2 x uint64_t)
         const uint64_t* code_ptr =
             (const uint64_t*)(d_one_bit_code + emb_id * CODE_BYTES);
+        uint64_t code_regs[NUM_U64];
+        code_regs[0] = code_ptr[0];
+        code_regs[1] = code_ptr[1];
 
         float ip = 0.0f;
         #pragma unroll
         for (int blk = 0; blk < NUM_U64; blk++) {
-            uint64_t bits = code_ptr[blk];
+            uint64_t bits = code_regs[blk];
             int base = blk * 64;
-            // Iterate all 64 bits. Compiler emits LDS (broadcast) + predicated FADD.
-            #pragma unroll
-            for (int i = 0; i < 64; i++) {
-                if ((bits >> i) & 1ULL)
-                    ip += smem_query[base + i];
+            // Skip zero bits using __ffsll intrinsic
+            while (bits) {
+                int pos = __ffsll(bits) - 1;
+                ip += smem_query[base + pos];
+                bits &= bits - 1;  // clear lowest set bit
             }
         }
         float dist = (ip - cb1_sumq) * d_one_bit_factor[emb_id];
@@ -92,16 +96,14 @@ __global__ void stage2_binary_ip_kernel_v2(
     {
         // Load binary code and factor ONCE per token
         const size_t token_id = d_token_ids[tok_idx];
-        const uint64_t* code_ptr =
-            (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
         const float factor = d_one_bit_factor[token_id];
 
-        // Pre-load the binary code into registers
+        // Load binary code into registers (2 x uint64_t)
+        const uint64_t* code_ptr =
+            (const uint64_t*)(d_one_bit_code + token_id * CODE_BYTES);
         uint64_t code_regs[NUM_U64];
-        #pragma unroll
-        for (int blk = 0; blk < NUM_U64; blk++) {
-            code_regs[blk] = code_ptr[blk];
-        }
+        code_regs[0] = code_ptr[0];
+        code_regs[1] = code_ptr[1];
 
         // Score against all Q_DOCLEN queries
         #pragma unroll
@@ -114,6 +116,9 @@ __global__ void stage2_binary_ip_kernel_v2(
             for (int blk = 0; blk < NUM_U64; blk++) {
                 uint64_t bits = code_regs[blk];
                 int base = blk * 64;
+                // Fully unrolled loop — compiler emits predicated FADD with zero branching.
+                // Do NOT replace with __ffsll: data-dependent branching causes warp divergence
+                // multiplied 32x across queries, resulting in 3.6x slowdown.
                 #pragma unroll
                 for (int i = 0; i < 64; i++) {
                     if ((bits >> i) & 1ULL)
@@ -319,8 +324,8 @@ __global__ void aggregate_stage1_atomic_kernel_opt(
     // Bounds check
     if (doc_id >= num_docs) return;
 
-    // Atomic max into doc_query_max[doc_id * Q_DOCLEN + q_idx]
-    size_t matrix_idx = (size_t)doc_id * Q_DOCLEN + q_idx;
+    // Atomic max into doc_query_max[q_idx * num_docs + doc_id] (transposed layout)
+    size_t matrix_idx = (size_t)q_idx * num_docs + doc_id;
     atomicMaxFloat(&d_doc_query_max[matrix_idx], dist);
 }
 
@@ -338,7 +343,7 @@ __global__ void sum_doc_scores_kernel(
     float score = 0.0f;
     #pragma unroll
     for (size_t q = 0; q < Q_DOCLEN; ++q) {
-        score += d_doc_query_max[doc_id * Q_DOCLEN + q];
+        score += d_doc_query_max[q * num_docs + doc_id];  // transposed: coalesced reads
     }
     d_doc_scores[doc_id] = score;
 }

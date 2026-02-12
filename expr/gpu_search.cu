@@ -21,7 +21,7 @@ int main() {
 
     Timer timer;
     timer.tick();
-    int nq = num_q;
+    int nq = 5;
     std::vector<std::vector<size_t>> results(nq);
     for (size_t i = 0; i < nq; ++i) {
         results[i] = index.search(&Q[i * Q_DOCLEN * d], k);
